@@ -1,0 +1,40 @@
+{
+  "name": "dev-toolbox-electron",
+  "version": "0.1.0",
+  "description": "基于 Electron、Vue 3 和 TypeScript 的开发者工具箱",
+  "main": "./out/main/index.js",
+  "author": "253506088",
+  "license": "MIT",
+  "private": true,
+  "scripts": {
+    "dev": "electron-vite dev",
+    "start": "electron-vite preview",
+    "typecheck": "vue-tsc --noEmit -p tsconfig.web.json && tsc --noEmit -p tsconfig.node.json",
+    "test": "vitest run",
+    "build": "vue-tsc --noEmit -p tsconfig.web.json && tsc --noEmit -p tsconfig.node.json && electron-vite build",
+    "pack": "vue-tsc --noEmit -p tsconfig.web.json && tsc --noEmit -p tsconfig.node.json && electron-vite build && electron-builder --dir",
+    "dist": "vue-tsc --noEmit -p tsconfig.web.json && tsc --noEmit -p tsconfig.node.json && electron-vite build && electron-builder"
+  },
+  "dependencies": {
+    "dayjs": "1.11.21",
+    "fast-xml-parser": "5.10.1",
+    "@lucide/vue": "1.25.0",
+    "monaco-editor": "0.55.1",
+    "naive-ui": "2.44.1",
+    "pinia": "4.0.2",
+    "sql-formatter": "15.8.2",
+    "vue": "3.5.40"
+  },
+  "devDependencies": {
+    "@types/node": "26.1.1",
+    "@vitejs/plugin-vue": "6.0.8",
+    "electron": "43.1.1",
+    "electron-builder": "26.15.3",
+    "electron-vite": "5.0.0",
+    "typescript": "5.9.3",
+    "vite": "7.3.6",
+    "vitest": "4.1.10",
+    "vue-tsc": "3.3.7"
+  },
+  "packageManager": "pnpm@10.32.1"
+}
