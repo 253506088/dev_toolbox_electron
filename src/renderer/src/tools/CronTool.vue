@@ -260,7 +260,7 @@ updateNextRunTimes()
 
 .field-token span {
   color: var(--text-muted);
-  font-size: 11px;
+  font-size: var(--ui-font-xs);
 }
 
 .field-token code {
@@ -270,14 +270,14 @@ updateNextRunTimes()
 
 .cron-summary h2 {
   margin: 20px 0 8px;
-  font-size: 14px;
+  font-size: var(--ui-font-size);
 }
 
 .cron-summary ol {
   margin: 0;
   padding-left: 26px;
   font-family: "Cascadia Mono", Consolas, monospace;
-  font-size: 12px;
+  font-size: var(--ui-font-sm);
   line-height: 2;
 }
 </style>

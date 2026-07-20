@@ -8,10 +8,18 @@ import {
   Database,
   Diff,
   Fingerprint,
+  Film,
+  FolderTree,
+  Image as ImageIcon,
   Link,
   ListFilter,
+  NotebookPen,
+  QrCode,
+  ScanLine,
   TableProperties,
-  TextQuote
+  TextQuote,
+  WandSparkles,
+  Video
 } from '@lucide/vue'
 
 export interface ToolRegistration {
@@ -23,9 +31,65 @@ export interface ToolRegistration {
 }
 
 /**
- * 第一阶段工具注册表，导航和内容区都只依赖此处。
+ * 工具注册表，导航和内容区都只依赖此处。
  */
 export const tools: ToolRegistration[] = [
+  {
+    id: 'notes',
+    name: '便签与提醒',
+    group: '日常工具',
+    icon: NotebookPen,
+    component: defineAsyncComponent(() => import('./NotesTool.vue'))
+  },
+  {
+    id: 'file-manager',
+    name: '文件管理器',
+    group: '日常工具',
+    icon: FolderTree,
+    component: defineAsyncComponent(() => import('./FileManagerTool.vue'))
+  },
+  {
+    id: 'qr-code',
+    name: '二维码',
+    group: '日常工具',
+    icon: QrCode,
+    component: defineAsyncComponent(() => import('./QrTool.vue'))
+  },
+  {
+    id: 'sd-prompt',
+    name: 'SD 提示词',
+    group: '日常工具',
+    icon: WandSparkles,
+    component: defineAsyncComponent(() => import('./SdPromptTool.vue'))
+  },
+  {
+    id: 'image-resize',
+    name: '图片缩放裁剪',
+    group: '图片与视频',
+    icon: ImageIcon,
+    component: defineAsyncComponent(() => import('./ImageResizeTool.vue'))
+  },
+  {
+    id: 'image-matting',
+    name: '批量抠图',
+    group: '图片与视频',
+    icon: ScanLine,
+    component: defineAsyncComponent(() => import('./ImageMattingTool.vue'))
+  },
+  {
+    id: 'video-frame',
+    name: '视频转序列帧',
+    group: '图片与视频',
+    icon: Film,
+    component: defineAsyncComponent(() => import('./VideoFrameTool.vue'))
+  },
+  {
+    id: 'video-matting',
+    name: '视频抠图',
+    group: '图片与视频',
+    icon: Video,
+    component: defineAsyncComponent(() => import('./VideoMattingTool.vue'))
+  },
   {
     id: 'diff',
     name: '文本对比',

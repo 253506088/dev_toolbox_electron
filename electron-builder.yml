@@ -6,6 +6,15 @@ directories:
 files:
   - out/**/*
   - package.json
+extraResources:
+  - from: resources/data
+    to: data
+    filter:
+      - '**/*'
+  - from: resources/ffmpeg
+    to: ffmpeg
+    filter:
+      - ffmpeg.exe
 win:
   icon: resources/icon.ico
   target:

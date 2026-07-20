@@ -74,11 +74,11 @@ function clear(): void {
     <div class="editor-grid">
       <div class="editor-panel">
         <div class="editor-label">输入</div>
-        <MonacoEditor v-model="input" aria-label="SQL IN 输入编辑器" />
+        <MonacoEditor v-model="input" language="sql" aria-label="SQL IN 输入编辑器" />
       </div>
       <div class="editor-panel">
         <div class="editor-label">输出</div>
-        <MonacoEditor v-model="output" read-only aria-label="SQL IN 输出编辑器" />
+        <MonacoEditor v-model="output" language="sql" read-only aria-label="SQL IN 输出编辑器" />
       </div>
     </div>
   </ToolPage>

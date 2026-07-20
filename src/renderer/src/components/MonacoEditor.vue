@@ -2,6 +2,8 @@
 import * as monaco from 'monaco-editor/esm/vs/editor/editor.api.js'
 import { onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useThemeStore } from '../stores/theme'
+import { useSettingsStore } from '../stores/settings'
+import { ensureMonacoThemes } from '../utils/monaco-theme'
 
 const props = withDefaults(
   defineProps<{
@@ -24,26 +26,29 @@ const emit = defineEmits<{
 }>()
 
 const themeStore = useThemeStore()
+const settingsStore = useSettingsStore()
 const host = ref<HTMLElement>()
 let editor: monaco.editor.IStandaloneCodeEditor | undefined
 let model: monaco.editor.ITextModel | undefined
 let internalUpdate = false
+let configurationListener: monaco.IDisposable | undefined
 
 /**
  * 创建 Monaco 编辑器并监听用户输入。
  */
 onMounted(() => {
-  defineEditorThemes()
+  ensureMonacoThemes()
   model = monaco.editor.createModel(props.modelValue, props.language)
   editor = monaco.editor.create(host.value!, {
     model,
     readOnly: props.readOnly,
     ariaLabel: props.ariaLabel,
-    theme: themeStore.isNeo ? 'dev-neo' : 'dev-standard',
+    theme: themeStore.monacoThemeName,
     automaticLayout: true,
     fontFamily: 'Cascadia Mono, Consolas, monospace',
-    fontSize: 13,
-    lineHeight: 20,
+    fontSize: settingsStore.editorFontSize,
+    lineHeight: 0,
+    mouseWheelZoom: true,
     lineNumbers: 'on',
     minimap: { enabled: false },
     overviewRulerLanes: 0,
@@ -61,6 +66,12 @@ onMounted(() => {
     if (internalUpdate) return
     emit('update:modelValue', model?.getValue() ?? '')
   })
+
+  configurationListener = editor.onDidChangeConfiguration((event) => {
+    if (!event.hasChanged(monaco.editor.EditorOption.fontSize) || !editor) return
+    const next = settingsStore.setEditorFontSize(editor.getOption(monaco.editor.EditorOption.fontSize))
+    if (next !== editor.getOption(monaco.editor.EditorOption.fontSize)) editor.updateOptions({ fontSize: next })
+  })
 })
 
 /**
@@ -76,50 +87,39 @@ watch(
   }
 )
 
+/** 语言属性变化时更新当前模型的语法高亮。 */
+watch(
+  () => props.language,
+  (language) => {
+    if (model && model.getLanguageId() !== language) monaco.editor.setModelLanguage(model, language)
+  }
+)
+
+/** 设置中心或其他编辑器改变字号时同步当前编辑器。 */
+watch(
+  () => settingsStore.editorFontSize,
+  (fontSize) => {
+    if (editor && editor.getOption(monaco.editor.EditorOption.fontSize) !== fontSize) editor.updateOptions({ fontSize })
+  }
+)
+
 /**
- * 切换应用风格时同步 Monaco 配色。
+ * 切换应用风格或明暗模式时同步 Monaco 配色。
  */
 watch(
-  () => themeStore.style,
-  () => monaco.editor.setTheme(themeStore.isNeo ? 'dev-neo' : 'dev-standard')
+  () => themeStore.monacoThemeName,
+  (themeName) => monaco.editor.setTheme(themeName)
 )
 
 /**
  * 组件卸载时释放编辑器模型，避免工具切换后残留资源。
  */
 onBeforeUnmount(() => {
+  configurationListener?.dispose()
   editor?.dispose()
   model?.dispose()
 })
 
-/**
- * 注册与应用两套风格匹配的 Monaco 浅色主题。
- */
-function defineEditorThemes(): void {
-  monaco.editor.defineTheme('dev-neo', {
-    base: 'vs',
-    inherit: true,
-    rules: [],
-    colors: {
-      'editor.background': '#FFFFFF',
-      'editorLineNumber.foreground': '#78918E',
-      'editorLineNumber.activeForeground': '#0F766E',
-      'editor.selectionBackground': '#99F6E455',
-      'editorCursor.foreground': '#F97316'
-    }
-  })
-  monaco.editor.defineTheme('dev-standard', {
-    base: 'vs',
-    inherit: true,
-    rules: [],
-    colors: {
-      'editor.background': '#FFFFFF',
-      'editorLineNumber.foreground': '#9CA3AF',
-      'editorLineNumber.activeForeground': '#0F766E',
-      'editor.selectionBackground': '#BFDBFE88'
-    }
-  })
-}
 </script>
 
 <template>

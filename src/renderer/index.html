@@ -3,6 +3,18 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <script>
+      try {
+        const mode = localStorage.getItem('dev-toolbox-color-mode') === 'dark' ? 'dark' : 'light'
+        const style = localStorage.getItem('dev-toolbox-style') === 'standard' ? 'standard' : 'neo'
+        document.documentElement.dataset.colorMode = mode
+        document.documentElement.dataset.style = style
+        document.documentElement.style.colorScheme = mode
+      } catch {
+        document.documentElement.dataset.colorMode = 'light'
+        document.documentElement.dataset.style = 'neo'
+      }
+    </script>
     <title>开发者工具箱</title>
   </head>
   <body>

@@ -328,7 +328,7 @@ onBeforeUnmount(() => window.removeEventListener('mouseup', commitSelection))
 }
 
 :deep(.excel-cell.selected) {
-  color: #134e4a;
-  background: #99f6e4;
+  color: var(--chip-text);
+  background: var(--chip-background);
 }
 </style>

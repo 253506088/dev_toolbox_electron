@@ -7,7 +7,17 @@ import { defineConfig, externalizeDepsPlugin } from 'electron-vite'
  */
 export default defineConfig({
   main: {
-    plugins: [externalizeDepsPlugin()]
+    plugins: [externalizeDepsPlugin()],
+    build: {
+      rollupOptions: {
+        input: {
+          index: resolve('src/main/index.ts'),
+          'folder-size-worker': resolve('src/main/workers/folder-size-worker.ts'),
+          'dictionary-worker': resolve('src/main/workers/dictionary-worker.ts'),
+          'image-worker': resolve('src/main/workers/image-worker.ts')
+        }
+      }
+    }
   },
   preload: {
     plugins: [externalizeDepsPlugin()]

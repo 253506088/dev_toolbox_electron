@@ -10,18 +10,24 @@ import type { TextOperation } from '../utils/text-operations'
 
 const input = ref('')
 const output = ref('')
+const inputLanguage = ref<'xml' | 'json'>('xml')
+const outputLanguage = ref<'xml' | 'json'>('json')
 const message = useMessage()
 const { busy, error, run } = useOperationState()
 
 /** 执行 XML 与 JSON 互转。 */
 async function transform(operation: TextOperation): Promise<void> {
+  inputLanguage.value = operation === 'xml-to-json' ? 'xml' : 'json'
+  outputLanguage.value = operation === 'xml-to-json' ? 'json' : 'xml'
   const result = await run(operation, input.value)
-  if (result !== undefined) output.value = result
+  if (result === undefined) return
+  output.value = result
 }
 
 /** 交换输入和输出。 */
 function swap(): void {
   ;[input.value, output.value] = [output.value, input.value]
+  ;[inputLanguage.value, outputLanguage.value] = [outputLanguage.value, inputLanguage.value]
 }
 
 /** 复制输出内容。 */
@@ -61,11 +67,11 @@ function clear(): void {
     <div class="editor-grid">
       <div class="editor-panel">
         <div class="editor-label">输入</div>
-        <MonacoEditor v-model="input" language="xml" aria-label="XML 或 JSON 输入编辑器" />
+        <MonacoEditor v-model="input" :language="inputLanguage" aria-label="XML 或 JSON 输入编辑器" />
       </div>
       <div class="editor-panel">
         <div class="editor-label">输出</div>
-        <MonacoEditor v-model="output" aria-label="XML 或 JSON 输出编辑器" />
+        <MonacoEditor v-model="output" :language="outputLanguage" aria-label="XML 或 JSON 输出编辑器" />
       </div>
     </div>
   </ToolPage>

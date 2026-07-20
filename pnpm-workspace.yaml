@@ -1,3 +1,8 @@
+allowBuilds:
+  electron-winstaller: true
+  esbuild: true
+minimumReleaseAgeExclude:
+  - zxing-wasm@3.1.2
 onlyBuiltDependencies:
   - electron
   - esbuild

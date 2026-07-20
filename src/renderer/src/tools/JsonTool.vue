@@ -62,7 +62,7 @@ function clear(): void {
       </NButton>
     </template>
     <template #status><span v-if="error" class="error-text">{{ error }}</span></template>
-    <NSpin :show="busy" style="height: 100%">
+    <NSpin :show="busy" class="editor-spin">
       <MonacoEditor v-model="text" language="json" aria-label="JSON 编辑器" />
     </NSpin>
   </ToolPage>
