@@ -7,6 +7,7 @@ import { registerMediaIpc } from './ipc/media-ipc'
 import { registerNotesIpc } from './ipc/notes-ipc'
 import { registerTextIpc } from './ipc/text-ipc'
 import { registerUtilityIpc } from './ipc/utility-ipc'
+import { registerWechatCaptureIpc } from './ipc/wechat-capture-ipc'
 import { DictionaryService } from './services/dictionary-service'
 import { FileService } from './services/file-service'
 import { FolderSizePool } from './services/folder-size-pool'
@@ -17,6 +18,8 @@ import { NoteService } from './services/note-service'
 import { ReminderScheduler } from './services/reminder-scheduler'
 import { ImageService } from './services/image-service'
 import { MediaSourceService } from './services/media-source-service'
+import { WechatCaptureService } from './services/wechat-capture-service'
+import { WechatContinuousCaptureService } from './services/wechat-continuous-capture-service'
 
 protocol.registerSchemesAsPrivileged([
   { scheme: 'note-image', privileges: { standard: true, secure: true, supportFetchAPI: true } },
@@ -27,6 +30,8 @@ let mainWindow: BrowserWindow | null = null
 let reminderScheduler: ReminderScheduler | null = null
 let batchTasks: BatchTaskService | null = null
 let ffmpegService: FfmpegService | null = null
+let wechatCapture: WechatCaptureService | null = null
+let wechatContinuousCapture: WechatContinuousCaptureService | null = null
 
 /** 创建应用主窗口，并限制网页只能在系统浏览器中打开外部链接。 */
 function createWindow(): void {
@@ -79,6 +84,8 @@ async function bootstrap(): Promise<void> {
   const images = new ImageService(mediaSources)
   batchTasks = new BatchTaskService()
   ffmpegService = new FfmpegService(mediaSources)
+  wechatCapture = new WechatCaptureService()
+  wechatContinuousCapture = new WechatContinuousCaptureService()
   await notes.initialize()
   registerTextIpc()
   registerNotesIpc(notes, holidays)
@@ -86,6 +93,7 @@ async function bootstrap(): Promise<void> {
   registerUtilityIpc()
   registerDictionaryIpc(dictionary)
   registerMediaIpc(images, batchTasks, ffmpegService)
+  registerWechatCaptureIpc(wechatCapture, wechatContinuousCapture)
   registerNoteImageProtocol(notes)
   mediaSources.registerProtocol()
   createWindow()
@@ -105,6 +113,8 @@ app.on('before-quit', () => {
   reminderScheduler?.stop()
   batchTasks?.stopAll()
   ffmpegService?.stopAll()
+  wechatCapture?.dispose()
+  wechatContinuousCapture?.dispose()
 })
 
 app.on('window-all-closed', () => {

@@ -8,6 +8,7 @@ import type {
 } from '../shared/electron-api'
 import type { BatchTaskEvent } from '../shared/batch-task'
 import type { MediaJobEvent } from '../shared/media-api'
+import type { WechatCaptureEvent } from '../shared/wechat-capture'
 
 /** 订阅一个白名单 IPC 事件，并返回取消订阅函数。 */
 function subscribe<T>(channel: string, callback: (payload: T) => void): () => void {
@@ -47,6 +48,16 @@ const api: ElectronApi = {
   dialog: {
     saveBinary: (suggestedName, bytes) => ipcRenderer.invoke('dialog:save-binary', suggestedName, bytes),
     openImage: () => ipcRenderer.invoke('dialog:open-image')
+  },
+  wechatCapture: {
+    listWindows: () => ipcRenderer.invoke('wechat-capture:list-windows'),
+    defaultOutputDirectory: () => ipcRenderer.invoke('wechat-capture:default-output-directory'),
+    selectOutputDirectory: () => ipcRenderer.invoke('wechat-capture:select-output-directory'),
+    start: (request) => ipcRenderer.invoke('wechat-capture:start', request),
+    startContinuous: (request) => ipcRenderer.invoke('wechat-capture:start-continuous', request),
+    stop: () => ipcRenderer.invoke('wechat-capture:stop'),
+    openOutput: (path) => ipcRenderer.invoke('wechat-capture:open-output', path),
+    onEvent: (callback) => subscribe<WechatCaptureEvent>('wechat-capture:event', callback)
   },
   dictionary: {
     load: () => ipcRenderer.invoke('dictionary:load'),

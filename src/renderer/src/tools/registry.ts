@@ -2,6 +2,7 @@ import { defineAsyncComponent, type Component } from 'vue'
 import type { LucideIcon } from '@lucide/vue'
 import {
   Braces,
+  Camera,
   CalendarClock,
   CodeXml,
   Columns3,
@@ -34,6 +35,13 @@ export interface ToolRegistration {
  * 工具注册表，导航和内容区都只依赖此处。
  */
 export const tools: ToolRegistration[] = [
+  {
+    id: 'wechat-capture',
+    name: '微信长截图',
+    group: '日常工具',
+    icon: Camera,
+    component: defineAsyncComponent(() => import('./WechatCaptureTool.vue'))
+  },
   {
     id: 'notes',
     name: '便签与提醒',

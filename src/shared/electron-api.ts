@@ -180,6 +180,24 @@ export interface ElectronApi {
     /** 选择一张图片并返回数据。 */
     openImage(): Promise<{ name: string; dataUrl: string } | null>
   }
+  wechatCapture: {
+    /** 列出当前可抓取的微信窗口。 */
+    listWindows(): Promise<WechatWindowSource[]>
+    /** 返回桌面上的默认输出目录。 */
+    defaultOutputDirectory(): Promise<string>
+    /** 让用户选择输出根目录。 */
+    selectOutputDirectory(): Promise<string | null>
+    /** 启动自动滚动截图。 */
+    start(request: WechatCaptureRequest): Promise<WechatCaptureStartResult>
+    /** 启动节点 2 的连续无缝长截图。 */
+    startContinuous(request: WechatContinuousCaptureRequest): Promise<WechatCaptureStartResult>
+    /** 停止当前截图并保存已抓取内容。 */
+    stop(): Promise<void>
+    /** 在系统文件管理器中打开输出目录。 */
+    openOutput(path: string): Promise<void>
+    /** 监听截图进度。 */
+    onEvent(callback: (event: WechatCaptureEvent) => void): () => void
+  }
   dictionary: {
     /** 读取合并后的 SD 词典。 */
     load(): Promise<DictionarySnapshot>
@@ -197,3 +215,10 @@ export interface ElectronApi {
   media: MediaApi
 }
 import type { MediaApi } from './media-api'
+import type {
+  WechatCaptureEvent,
+  WechatCaptureRequest,
+  WechatCaptureStartResult,
+  WechatContinuousCaptureRequest,
+  WechatWindowSource
+} from './wechat-capture'
