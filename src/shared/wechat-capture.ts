@@ -63,6 +63,7 @@ export interface WechatCaptureStartResult {
 export const MAX_ACCEPTED_OVERLAP_DIFFERENCE = 0.012
 export const MAX_CONTINUOUS_OVERLAP_DIFFERENCE = 0.025
 export const CONTINUOUS_SAFE_BOTTOM_RATIO = 0.7
+export const CONTINUOUS_MAX_SHIFT_RATIO = 0.62
 
 /** 计算连续帧中避开底部固定悬浮控件的安全条带。 */
 export function continuousSafeStripRegion(frameHeight: number, shift: number): { top: number; height: number; safeBottom: number } {
@@ -87,8 +88,26 @@ export function continuousFrameDecision(
   if (overlap === 0) return { kind: 'reject', overlap: 0, shift: 0 }
   const shift = frameHeight - overlap
   if (shift <= Math.max(3, Math.round(frameHeight * 0.008))) return { kind: 'stationary', overlap, shift }
-  if (shift > frameHeight * 0.55) return { kind: 'reject', overlap, shift }
+  if (shift > frameHeight * CONTINUOUS_MAX_SHIFT_RATIO) return { kind: 'reject', overlap, shift }
   return { kind: 'append', overlap, shift }
+}
+
+/**
+ * 依据预期位移收窄重叠搜索范围，降低误匹配并加快搜索。
+ * 预期无效或窗口退化时返回 null，调用方应回退全范围搜索。
+ */
+export function continuousOverlapSearchWindow(
+  frameHeight: number,
+  expectedShift: number,
+  marginPx?: number
+): { minimumRatio: number; maximumRatio: number } | null {
+  if (!Number.isFinite(frameHeight) || frameHeight < 8) return null
+  if (!Number.isFinite(expectedShift) || expectedShift <= 0 || expectedShift >= frameHeight) return null
+  const margin = marginPx ?? Math.max(60, Math.round(frameHeight * 0.1))
+  const minimumRatio = Math.max(0.05, (frameHeight - expectedShift - margin) / frameHeight)
+  const maximumRatio = Math.min(0.995, (frameHeight - expectedShift + margin) / frameHeight)
+  if (maximumRatio - minimumRatio < 0.02) return null
+  return { minimumRatio, maximumRatio }
 }
 
 /** 只把高置信度匹配换算成原图裁切高度；可疑匹配一律保留完整画面。 */
@@ -150,4 +169,107 @@ export function findVerticalOverlap(
     }
   }
   return { overlap: bestOverlap, score: bestScore }
+}
+
+/**
+ * 标记灰度长图中接近纯聊天背景的“空白行”（消息之间的间隙）。
+ * 空白行需同时满足：整行像素近似均匀，且行均值接近估算出的背景亮度，
+ * 避免把纯色大图内部的均匀行误判为可切割的间隙。
+ */
+export function computeBlankRows(gray: ArrayLike<number>, width: number, height: number, tolerance = 10): Uint8Array {
+  const flags = new Uint8Array(height)
+  if (width < 1 || height < 1 || gray.length !== width * height) return flags
+  const means = new Float64Array(height)
+  const uniformMeans: number[] = []
+  for (let row = 0; row < height; row += 1) {
+    const offset = row * width
+    let min = 255
+    let max = 0
+    let sum = 0
+    for (let column = 0; column < width; column += 1) {
+      const value = gray[offset + column]
+      if (value < min) min = value
+      if (value > max) max = value
+      sum += value
+    }
+    means[row] = sum / width
+    if (max - min <= tolerance) {
+      flags[row] = 1
+      uniformMeans.push(means[row])
+    }
+  }
+  if (uniformMeans.length === 0) return flags
+  uniformMeans.sort((first, second) => first - second)
+  const background = uniformMeans[Math.floor(uniformMeans.length / 2)]
+  for (let row = 0; row < height; row += 1) {
+    if (flags[row] === 1 && Math.abs(means[row] - background) > tolerance * 1.5) flags[row] = 0
+  }
+  return flags
+}
+
+/** 长图分屏切片：top 为长图内起始行，height 为切片高度。 */
+export interface ScreenSlice {
+  top: number
+  height: number
+}
+
+/**
+ * 依据空白行为长图规划分屏切点：优先在目标高度附近的空白行（消息间隙）中间下刀；
+ * 附近没有空白行时按固定高度切割，并让下一屏向上重叠一段，保证消息不因截断而丢失。
+ */
+export function planScreenSlices(
+  blankRows: ArrayLike<number | boolean>,
+  viewportHeight: number,
+  searchRatio = 0.15,
+  overlapPx = 48
+): ScreenSlice[] {
+  const total = blankRows.length
+  if (total <= 0) return []
+  if (!Number.isFinite(viewportHeight) || viewportHeight < 8) return [{ top: 0, height: total }]
+  const searchWindow = Math.max(1, Math.round(viewportHeight * searchRatio))
+  const overlap = Math.max(0, Math.min(Math.round(overlapPx), Math.floor(viewportHeight / 3)))
+  const slices: ScreenSlice[] = []
+  let top = 0
+  while (total - top > Math.round(viewportHeight * 1.1)) {
+    const target = top + viewportHeight
+    const cut = findBlankCutNear(blankRows, target, searchWindow, top + Math.floor(viewportHeight / 2), total - 1)
+    if (cut !== null) {
+      slices.push({ top, height: cut - top })
+      top = cut
+    } else {
+      slices.push({ top, height: viewportHeight })
+      top = target - overlap
+    }
+  }
+  slices.push({ top, height: total - top })
+  const last = slices[slices.length - 1]
+  if (slices.length > 1 && last.height < 16) {
+    slices.pop()
+    const previous = slices[slices.length - 1]
+    previous.height = total - previous.top
+  }
+  return slices
+}
+
+/** 在目标行附近寻找距离最近的空白行，并返回其所在空白段的中点。 */
+function findBlankCutNear(
+  blankRows: ArrayLike<number | boolean>,
+  target: number,
+  searchWindow: number,
+  lowerBound: number,
+  upperBound: number
+): number | null {
+  const low = Math.max(lowerBound, target - searchWindow)
+  const high = Math.min(upperBound, target + searchWindow)
+  for (let distance = 0; distance <= searchWindow; distance += 1) {
+    for (const row of distance === 0 ? [target] : [target - distance, target + distance]) {
+      if (row < low || row > high || !blankRows[row]) continue
+      let start = row
+      let end = row
+      while (start - 1 >= low && blankRows[start - 1]) start -= 1
+      while (end + 1 <= high && blankRows[end + 1]) end += 1
+      return Math.floor((start + end + 1) / 2)
+    }
+  }
+  return null
 }

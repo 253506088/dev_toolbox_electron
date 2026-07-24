@@ -6,4 +6,7 @@ dist/
 .DS_Store
 resources/ffmpeg/ffmpeg.exe
 /my_doc/
+!/my_doc/
+/my_doc/*
+!/开发、调试与发布指南.md
 /.idea/

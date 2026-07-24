@@ -1,21 +1,29 @@
-import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process'
 import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { app, desktopCapturer, globalShortcut, type WebContents } from 'electron'
 import sharp from 'sharp'
 import {
+  computeBlankRows,
   continuousFrameDecision,
+  continuousOverlapSearchWindow,
   continuousSafeStripRegion,
   findVerticalOverlap,
   normalizedImageDifference,
+  planScreenSlices,
   type WechatCaptureEvent,
   type WechatContinuousCaptureRequest,
   type WechatCaptureStartResult
 } from '../../shared/wechat-capture'
+import { scrollChatToTop, waitForStillFrame, WechatScrollController, FRAME_STILL_THRESHOLD } from './wechat-scroll-controller'
 
 const CAPTURE_SIZE = { width: 1920, height: 1080 }
 const LONG_IMAGE_HEIGHT = 20_000
 const STOP_HOTKEY = 'CommandOrControl+E'
+const INITIAL_PULSE_NOTCHES = 12
+const MIN_PULSE_NOTCHES = 4
+const MAX_PULSE_NOTCHES = 90
+const TARGET_SHIFT_RATIO = 0.5
+const SETTLE_TIMEOUT_MS = 1600
 
 interface ContinuousFrame {
   buffer: Buffer
@@ -23,7 +31,6 @@ interface ContinuousFrame {
   height: number
   fingerprint: Uint8Array
   fingerprintHeight: number
-  previewDataUrl: string
 }
 
 interface ContinuousRun {
@@ -31,7 +38,7 @@ interface ContinuousRun {
   cancelled: boolean
   sender: WebContents
   outputDirectory: string
-  scroller: ContinuousScrollController | null
+  scroller: WechatScrollController | null
 }
 
 interface FrameReport {
@@ -41,6 +48,50 @@ interface FrameReport {
   overlap: number
   shift: number
   score: number
+  pulseNotches: number
+}
+
+/** 保序异步写盘队列：采集主循环不再逐帧等待 PNG 编码与磁盘写入。 */
+class StripWriteQueue {
+  private chain: Promise<void> = Promise.resolve()
+  private pendingCount = 0
+  private completed = 0
+  private failure: Error | null = null
+
+  push(job: () => Promise<unknown>): void {
+    this.pendingCount += 1
+    this.chain = this.chain
+      .then(async () => {
+        if (this.failure) return
+        try {
+          await job()
+          this.completed += 1
+        } catch (error) {
+          this.failure = error instanceof Error ? error : new Error(String(error))
+        }
+      })
+      .finally(() => {
+        this.pendingCount -= 1
+      })
+  }
+
+  get depth(): number {
+    return this.pendingCount
+  }
+
+  /** 已成功落盘的任务数；任务严格按提交顺序执行，可据此截断路径列表。 */
+  get completedCount(): number {
+    return this.completed
+  }
+
+  assertHealthy(): void {
+    if (this.failure) throw this.failure
+  }
+
+  async drain(): Promise<void> {
+    await this.chain
+    if (this.failure) throw this.failure
+  }
 }
 
 /** 节点 2：连续采集相邻帧，只把可靠的新像素条追加到长图。 */
@@ -75,7 +126,7 @@ export class WechatContinuousCaptureService {
   stop(): void {
     if (!this.activeRun) return
     this.activeRun.cancelled = true
-    this.stopScroller(this.activeRun)
+    void this.stopScroller(this.activeRun)
   }
 
   dispose(): void {
@@ -89,10 +140,12 @@ export class WechatContinuousCaptureService {
     const screenshotsDirectory = join(run.outputDirectory, 'screenshots')
     const stripPaths: string[] = []
     const report: FrameReport[] = []
+    const writer = new StripWriteQueue()
     let capturedHeight = 0
     let acceptedFrames = 0
     let reachedBottom = false
     let failure: Error | null = null
+    let pixelsPerNotch: number | null = null
 
     try {
       await Promise.all([
@@ -100,9 +153,10 @@ export class WechatContinuousCaptureService {
         mkdir(longDirectory, { recursive: true }),
         mkdir(screenshotsDirectory, { recursive: true })
       ])
+      run.scroller = WechatScrollController.start(request.sourceId, request.crop)
       this.emit(run, 'positioning', '连续长截图：正在快速定位聊天顶部...', 0, 0)
       const first = await this.positionAtTop(run, request)
-      if (run.cancelled) {
+      if (!first || run.cancelled) {
         this.emit(run, 'stopped', '连续长截图已停止', 0, 0)
         return
       }
@@ -110,41 +164,79 @@ export class WechatContinuousCaptureService {
       const firstRegion = continuousSafeStripRegion(first.height, 1)
       const safeBottom = firstRegion.safeBottom
       const firstPath = join(stripsDirectory, 'strip_00000.png')
-      await sharp(first.buffer).extract({ left: 0, top: 0, width: first.width, height: safeBottom }).png().toFile(firstPath)
+      writer.push(() =>
+        sharp(first.buffer).extract({ left: 0, top: 0, width: first.width, height: safeBottom }).png().toFile(firstPath)
+      )
       stripPaths.push(firstPath)
-      report.push({ frame: 0, timestamp: new Date().toISOString(), kind: 'initial', overlap: 0, shift: first.height, score: 0 })
+      report.push({ frame: 0, timestamp: new Date().toISOString(), kind: 'initial', overlap: 0, shift: first.height, score: 0, pulseNotches: 0 })
       capturedHeight = safeBottom
       acceptedFrames = 1
       let previous = first
       let observedFrames = 1
       let stationaryCount = 0
-      const bottomThreshold = 4
+      const bottomThreshold = 3
       let lastPulseAt = 0
+      let pulseNotches = INITIAL_PULSE_NOTCHES
 
-      run.scroller = this.startScroller(request)
-      this.emit(run, 'capturing', '连续滚动采集中，按 Ctrl+E 可停止', acceptedFrames, capturedHeight, first.previewDataUrl)
+      this.emit(run, 'capturing', '连续滚动采集中，按 Ctrl+E 可停止', acceptedFrames, capturedHeight, await this.preview(first.buffer))
 
       try {
         while (!run.cancelled && observedFrames < request.maxFrames) {
           this.assertSender(run)
+          writer.assertHealthy()
           const pacingDelay = Math.max(0, request.scrollIntervalMs - (Date.now() - lastPulseAt))
           if (pacingDelay > 0) await delay(pacingDelay)
-          await run.scroller.pulse()
+          await run.scroller.scroll(-pulseNotches)
           lastPulseAt = Date.now()
           await delay(request.frameIntervalMs)
-          let current = await this.capture(request)
-          observedFrames += 1
-          let match = matchContinuousFrames(previous, current)
-          let decision = continuousFrameDecision(match, previous.height, previous.fingerprintHeight)
-          report.push(frameReport(observedFrames - 1, decision, match.score))
+          const settled = await waitForStillFrame(() => this.capture(request), () => run.cancelled, {
+            pollDelayMs: request.frameIntervalMs,
+            timeoutMs: SETTLE_TIMEOUT_MS
+          })
+          observedFrames += settled.samples
+          if (run.cancelled) break
+          let current = settled.frame
 
-          for (let retry = 0; decision.kind === 'reject' && retry < 3 && observedFrames < request.maxFrames; retry += 1) {
-            await delay(request.frameIntervalMs)
+          // 底部快速判定：画面与上一接受帧几乎一致时直接按静止处理，不做重叠搜索。
+          // 窗口化搜索不包含“零位移”解，聊天背景又高度自相似，到底后容易凑出低分假位移，
+          // 导致静止计数永远清零、采集不会自动结束。
+          const stillDifference = normalizedImageDifference(previous.fingerprint, current.fingerprint)
+          if (stillDifference < FRAME_STILL_THRESHOLD) {
+            report.push({
+              frame: observedFrames - 1,
+              timestamp: new Date().toISOString(),
+              kind: 'stationary',
+              overlap: previous.height,
+              shift: 0,
+              score: stillDifference,
+              pulseNotches
+            })
+            stationaryCount += 1
+            if (stationaryCount >= bottomThreshold) {
+              reachedBottom = true
+              break
+            }
+            continue
+          }
+
+          const expectedShift = pixelsPerNotch === null ? null : pulseNotches * pixelsPerNotch
+          let match = matchContinuousFrames(previous, current, expectedShift)
+          let decision = continuousFrameDecision(match, previous.height, previous.fingerprintHeight)
+          if (decision.kind === 'reject' && expectedShift !== null) {
+            match = matchContinuousFrames(previous, current, null)
+            decision = continuousFrameDecision(match, previous.height, previous.fingerprintHeight)
+          }
+          report.push(frameReport(observedFrames - 1, decision, match.score, pulseNotches))
+
+          let usedRetry = false
+          for (let retry = 0; decision.kind === 'reject' && retry < 3 && observedFrames < request.maxFrames && !run.cancelled; retry += 1) {
+            usedRetry = true
+            await delay(Math.max(150, request.frameIntervalMs))
             current = await this.capture(request)
             observedFrames += 1
-            match = matchContinuousFrames(previous, current)
+            match = matchContinuousFrames(previous, current, null)
             decision = continuousFrameDecision(match, previous.height, previous.fingerprintHeight)
-            report.push(frameReport(observedFrames - 1, decision, match.score))
+            report.push(frameReport(observedFrames - 1, decision, match.score, pulseNotches))
           }
 
           if (decision.kind === 'stationary') {
@@ -162,27 +254,39 @@ export class WechatContinuousCaptureService {
               stationaryCount += 1
               continue
             }
-            throw new Error('当前滚动后的画面经过 3 次稳定重采样仍无法可靠对齐，已停止以避免产生断层')
+            throw new Error('当前滚动后的画面经过多次稳定重采样仍无法可靠对齐，已停止以避免产生断层')
           }
 
           stationaryCount = 0
           const stripPath = join(stripsDirectory, `strip_${String(acceptedFrames).padStart(5, '0')}.png`)
           const stripRegion = continuousSafeStripRegion(current.height, decision.shift)
-          await sharp(current.buffer)
-            .extract({ left: 0, top: stripRegion.top, width: current.width, height: stripRegion.height })
-            .png()
-            .toFile(stripPath)
+          const stripSource = current.buffer
+          const stripWidth = current.width
+          writer.push(() =>
+            sharp(stripSource).extract({ left: 0, top: stripRegion.top, width: stripWidth, height: stripRegion.height }).png().toFile(stripPath)
+          )
           stripPaths.push(stripPath)
           capturedHeight += decision.shift
           acceptedFrames += 1
+
+          if (settled.still && !usedRetry && pulseNotches > 0) {
+            const measured = decision.shift / pulseNotches
+            if (pixelsPerNotch === null) pixelsPerNotch = measured
+            else if (expectedShift === null || decision.shift > expectedShift * 0.3) pixelsPerNotch = pixelsPerNotch * 0.6 + measured * 0.4
+          }
+          if (pixelsPerNotch !== null && pixelsPerNotch > 0.1) {
+            pulseNotches = clampInt(Math.round(current.height * TARGET_SHIFT_RATIO / pixelsPerNotch), MIN_PULSE_NOTCHES, MAX_PULSE_NOTCHES)
+          }
+
           previous = current
+          if (writer.depth > 8) await writer.drain()
           this.emit(
             run,
             'capturing',
             `连续采集中：已追加 ${capturedHeight.toLocaleString('zh-CN')} 像素`,
             acceptedFrames,
             capturedHeight,
-            current.previewDataUrl
+            await this.preview(current.buffer)
           )
         }
       } catch (error) {
@@ -194,13 +298,22 @@ export class WechatContinuousCaptureService {
       const stopped = run.cancelled
       const hitLimit = !stopped && !reachedBottom && !failure
       if (reachedBottom) {
-        const tailHeight = previous.height - safeBottom
+        const tailFrame = previous
+        const tailHeight = tailFrame.height - safeBottom
         if (tailHeight > 0) {
           const tailPath = join(stripsDirectory, 'strip_tail.png')
-          await sharp(previous.buffer).extract({ left: 0, top: safeBottom, width: previous.width, height: tailHeight }).png().toFile(tailPath)
+          writer.push(() =>
+            sharp(tailFrame.buffer).extract({ left: 0, top: safeBottom, width: tailFrame.width, height: tailHeight }).png().toFile(tailPath)
+          )
           stripPaths.push(tailPath)
           capturedHeight += tailHeight
         }
+      }
+      try {
+        await writer.drain()
+      } catch (error) {
+        if (!failure) failure = error instanceof Error ? error : new Error(String(error))
+        stripPaths.length = writer.completedCount
       }
       this.emit(run, 'stitching', '正在生成无缝长图、分屏和 Markdown...', acceptedFrames, capturedHeight)
       const longPaths = await this.buildLongImages(stripPaths, longDirectory)
@@ -216,6 +329,7 @@ export class WechatContinuousCaptureService {
         reachedBottom,
         stopped,
         failure: failure?.message,
+        pixelsPerNotch,
         frames: report
       }, null, 2), 'utf8')
       const markdownPath = await this.writeMarkdown(
@@ -242,27 +356,28 @@ export class WechatContinuousCaptureService {
       }
     } catch (error) {
       await this.stopScroller(run)
-      const message = error instanceof Error ? error.message : String(error)
-      this.emit(run, 'error', message, acceptedFrames, capturedHeight)
+      if (run.cancelled) {
+        this.emit(run, 'stopped', '连续长截图已停止', acceptedFrames, capturedHeight)
+      } else {
+        const message = error instanceof Error ? error.message : String(error)
+        this.emit(run, 'error', message, acceptedFrames, capturedHeight)
+      }
     } finally {
       if (this.activeRun === run) this.activeRun = null
       globalShortcut.unregister(STOP_HOTKEY)
     }
   }
 
-  private async positionAtTop(run: ContinuousRun, request: WechatContinuousCaptureRequest): Promise<ContinuousFrame> {
-    let previous = await this.capture(request)
-    let stableCount = 0
-    for (let attempt = 0; attempt < 120 && stableCount < 3 && !run.cancelled; attempt += 1) {
-      await this.scrollOnce(request, 'up', 80)
-      await delay(250)
-      const current = await this.capture(request)
-      stableCount = normalizedImageDifference(previous.fingerprint, current.fingerprint) < 0.0035 ? stableCount + 1 : 0
-      previous = current
-      this.emit(run, 'positioning', `连续长截图：正在定位顶部${'.'.repeat((attempt % 3) + 1)}`, 0, 0)
-    }
-    if (stableCount < 3 && !run.cancelled) throw new Error('未能确认聊天记录顶部，请检查框选区域')
-    return previous
+  private async positionAtTop(run: ContinuousRun, request: WechatContinuousCaptureRequest): Promise<ContinuousFrame | null> {
+    if (!run.scroller) throw new Error('滚动控制进程未启动')
+    return scrollChatToTop({
+      controller: run.scroller,
+      capture: () => this.capture(request),
+      isCancelled: () => run.cancelled,
+      onProgress: (burst) =>
+        this.emit(run, 'positioning', `连续长截图：正在快速定位顶部（第 ${burst + 1} 次翻页）...`, 0, 0),
+      pollDelayMs: Math.min(120, request.frameIntervalMs)
+    })
   }
 
   private async capture(request: WechatContinuousCaptureRequest): Promise<ContinuousFrame> {
@@ -274,32 +389,20 @@ export class WechatContinuousCaptureService {
     if (!metadata.width || !metadata.height) throw new Error('无法读取微信窗口尺寸')
     const region = cropToPixels(request.crop, metadata.width, metadata.height)
     const buffer = await image.extract(region).png().toBuffer()
-    const fingerprintHeight = region.height
-    const [fingerprint, preview] = await Promise.all([
-      sharp(buffer).grayscale().raw().toBuffer(),
-      sharp(buffer).resize({ width: 240, withoutEnlargement: true }).png().toBuffer()
-    ])
+    const fingerprint = await sharp(buffer).grayscale().raw().toBuffer()
     return {
       buffer,
       width: region.width,
       height: region.height,
       fingerprint,
-      fingerprintHeight,
-      previewDataUrl: `data:image/png;base64,${preview.toString('base64')}`
+      fingerprintHeight: region.height
     }
   }
 
-  private startScroller(request: WechatContinuousCaptureRequest): ContinuousScrollController {
-    const hwnd = parseWindowHandle(request.sourceId)
-    if (!hwnd) throw new Error('无法识别微信窗口句柄')
-    const script = controlledScrollScript(hwnd, request.crop)
-    const encoded = Buffer.from(script, 'utf16le').toString('base64')
-    const child = spawn(
-      'powershell.exe',
-      ['-NoProfile', '-NonInteractive', '-OutputFormat', 'Text', '-EncodedCommand', encoded],
-      { windowsHide: true }
-    )
-    return new ContinuousScrollController(child)
+  /** 预览图只在需要推送进度时才生成，避免每次采样都做缩放编码。 */
+  private async preview(buffer: Buffer): Promise<string> {
+    const image = await sharp(buffer).resize({ width: 240, withoutEnlargement: true }).png().toBuffer()
+    return `data:image/png;base64,${image.toString('base64')}`
   }
 
   private async stopScroller(run: ContinuousRun): Promise<void> {
@@ -307,21 +410,6 @@ export class WechatContinuousCaptureService {
     if (!child) return
     run.scroller = null
     await child.stop()
-  }
-
-  private async scrollOnce(request: WechatContinuousCaptureRequest, direction: 'up' | 'down', steps: number): Promise<void> {
-    const hwnd = parseWindowHandle(request.sourceId)
-    if (!hwnd) throw new Error('无法识别微信窗口句柄')
-    const script = oneShotScrollScript(hwnd, request.crop, direction, steps)
-    const encoded = Buffer.from(script, 'utf16le').toString('base64')
-    await new Promise<void>((resolve, reject) => {
-      const child = spawn('powershell.exe', ['-NoProfile', '-NonInteractive', '-EncodedCommand', encoded], { windowsHide: true })
-      let errorText = ''
-      child.stderr.setEncoding('utf8')
-      child.stderr.on('data', (chunk: string) => { errorText += chunk })
-      child.once('error', reject)
-      child.once('exit', (code) => code === 0 ? resolve() : reject(new Error(errorText.trim() || '无法控制微信窗口滚动')))
-    })
   }
 
   private async buildLongImages(stripPaths: string[], outputDirectory: string): Promise<string[]> {
@@ -365,17 +453,60 @@ export class WechatContinuousCaptureService {
     return outputPaths
   }
 
+  /** 把多张长图视作一条连续画布，优先在消息间隙下刀切分屏，跨长图边界的切片自动拼合。 */
   private async buildScreenshots(longPaths: string[], outputDirectory: string, viewportHeight: number): Promise<string[]> {
-    const outputPaths: string[] = []
+    if (longPaths.length === 0) return []
+    const segments: Array<{ path: string; top: number; height: number }> = []
+    const blankChunks: Uint8Array[] = []
+    let width = 0
+    let totalHeight = 0
     for (const longPath of longPaths) {
       const metadata = await sharp(longPath).metadata()
       if (!metadata.width || !metadata.height) throw new Error('无法读取连续长图尺寸')
-      for (let top = 0; top < metadata.height; top += viewportHeight) {
-        const height = Math.min(viewportHeight, metadata.height - top)
-        const path = join(outputDirectory, `screen_${String(outputPaths.length + 1).padStart(4, '0')}.png`)
-        await sharp(longPath).extract({ left: 0, top, width: metadata.width, height }).png().toFile(path)
-        outputPaths.push(path)
+      if (width === 0) width = metadata.width
+      if (metadata.width !== width) throw new Error('连续长图宽度不一致')
+      const gray = await sharp(longPath).grayscale().raw().toBuffer()
+      blankChunks.push(computeBlankRows(gray, metadata.width, metadata.height))
+      segments.push({ path: longPath, top: totalHeight, height: metadata.height })
+      totalHeight += metadata.height
+    }
+    const blankRows = new Uint8Array(totalHeight)
+    let offset = 0
+    for (const chunk of blankChunks) {
+      blankRows.set(chunk, offset)
+      offset += chunk.length
+    }
+
+    const slices = planScreenSlices(blankRows, viewportHeight)
+    const outputPaths: string[] = []
+    for (const slice of slices) {
+      const path = join(outputDirectory, `screen_${String(outputPaths.length + 1).padStart(4, '0')}.png`)
+      const covering = segments.filter(
+        (segment) => segment.top < slice.top + slice.height && segment.top + segment.height > slice.top
+      )
+      if (covering.length === 1) {
+        const segment = covering[0]
+        await sharp(segment.path)
+          .extract({ left: 0, top: slice.top - segment.top, width, height: slice.height })
+          .png()
+          .toFile(path)
+      } else {
+        const pieces: Array<{ input: Buffer; top: number; left: number }> = []
+        for (const segment of covering) {
+          const sourceTop = Math.max(0, slice.top - segment.top)
+          const sourceBottom = Math.min(segment.height, slice.top + slice.height - segment.top)
+          const piece = await sharp(segment.path)
+            .extract({ left: 0, top: sourceTop, width, height: sourceBottom - sourceTop })
+            .png()
+            .toBuffer()
+          pieces.push({ input: piece, top: segment.top + sourceTop - slice.top, left: 0 })
+        }
+        await sharp({ create: { width, height: slice.height, channels: 3, background: '#ffffff' } })
+          .composite(pieces)
+          .png()
+          .toFile(path)
       }
+      outputPaths.push(path)
     }
     return outputPaths
   }
@@ -466,21 +597,27 @@ export class WechatContinuousCaptureService {
   }
 }
 
-function matchContinuousFrames(previous: ContinuousFrame, current: ContinuousFrame): { overlap: number; score: number } {
+function matchContinuousFrames(
+  previous: ContinuousFrame,
+  current: ContinuousFrame,
+  expectedShift: number | null
+): { overlap: number; score: number } {
+  const searchWindow = expectedShift === null ? null : continuousOverlapSearchWindow(previous.fingerprintHeight, expectedShift)
   return findVerticalOverlap(
     previous.fingerprint,
     current.fingerprint,
     previous.width,
     previous.fingerprintHeight,
-    0.35,
-    0.995
+    searchWindow?.minimumRatio ?? 0.35,
+    searchWindow?.maximumRatio ?? 0.995
   )
 }
 
 function frameReport(
   frame: number,
   decision: { kind: 'append' | 'stationary' | 'reject'; overlap: number; shift: number },
-  score: number
+  score: number,
+  pulseNotches: number
 ): FrameReport {
   return {
     frame,
@@ -488,74 +625,8 @@ function frameReport(
     kind: decision.kind,
     overlap: decision.overlap,
     shift: decision.shift,
-    score
-  }
-}
-
-/** 与常驻 PowerShell 进程逐次握手，确认一轮采集完成后才允许再次滚动。 */
-class ContinuousScrollController {
-  private readonly pending: Array<{ resolve: () => void; reject: (error: Error) => void }> = []
-  private outputBuffer = ''
-  private errorText = ''
-  private failure: Error | null = null
-
-  constructor(private readonly child: ChildProcessWithoutNullStreams) {
-    child.stdout.setEncoding('utf8')
-    child.stdout.on('data', (chunk: string) => this.consumeOutput(chunk))
-    child.stderr.setEncoding('utf8')
-    child.stderr.on('data', (chunk: string) => {
-      this.errorText = `${this.errorText}${chunk}`.trim().slice(-500)
-    })
-    child.once('error', (error) => this.fail(error))
-    child.once('exit', (code) => {
-      if (code !== 0 && !child.killed) {
-        const message = this.errorText.replace(/^#< CLIXML\s*/i, '').trim()
-        this.fail(new Error(message || `连续滚动控制进程退出，退出码 ${code ?? 'unknown'}`))
-      } else {
-        this.fail(new Error('连续滚动控制进程已结束'))
-      }
-    })
-  }
-
-  pulse(): Promise<void> {
-    if (this.failure) return Promise.reject(this.failure)
-    if (this.child.exitCode !== null || this.child.killed) return Promise.reject(new Error('连续滚动控制进程未运行'))
-    return new Promise<void>((resolve, reject) => {
-      const item = { resolve, reject }
-      this.pending.push(item)
-      this.child.stdin.write('scroll\n', (error) => {
-        if (!error) return
-        const index = this.pending.indexOf(item)
-        if (index >= 0) this.pending.splice(index, 1)
-        reject(error)
-      })
-    })
-  }
-
-  async stop(): Promise<void> {
-    if (this.child.exitCode !== null || this.child.killed) return
-    this.child.stdin.write('quit\n')
-    await Promise.race([
-      new Promise<void>((resolve) => this.child.once('exit', () => resolve())),
-      delay(500)
-    ])
-    if (this.child.exitCode === null && !this.child.killed) this.child.kill()
-  }
-
-  private consumeOutput(chunk: string): void {
-    this.outputBuffer += chunk
-    const lines = this.outputBuffer.split(/\r?\n/)
-    this.outputBuffer = lines.pop() ?? ''
-    for (const line of lines) {
-      if (line.trim() !== 'ok') continue
-      this.pending.shift()?.resolve()
-    }
-  }
-
-  private fail(error: Error): void {
-    if (this.failure) return
-    this.failure = error
-    for (const item of this.pending.splice(0)) item.reject(error)
+    score,
+    pulseNotches
   }
 }
 
@@ -577,65 +648,8 @@ function cropToPixels(crop: WechatContinuousCaptureRequest['crop'], width: numbe
   return { left, top, width: width - left - right, height: height - top - bottom }
 }
 
-function parseWindowHandle(sourceId: string): string | null {
-  return /^window:(\d+):/.exec(sourceId)?.[1] ?? null
-}
-
-function nativeScript(hwnd: string, crop: WechatContinuousCaptureRequest['crop']): string {
-  const xRatio = (crop.left + (100 - crop.right)) / 200
-  const yRatio = (crop.top + (100 - crop.bottom)) / 200
-  return `
-Add-Type @'
-using System;
-using System.Runtime.InteropServices;
-public static class WechatContinuousNative {
-  [StructLayout(LayoutKind.Sequential)] public struct RECT { public int Left; public int Top; public int Right; public int Bottom; }
-  [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr hWnd, out RECT rect);
-  [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr hWnd);
-  [DllImport("user32.dll")] public static extern bool ShowWindowAsync(IntPtr hWnd, int command);
-  [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
-  [DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y);
-  [DllImport("user32.dll")] public static extern void mouse_event(uint flags, uint dx, uint dy, int data, UIntPtr extraInfo);
-}
-'@
-$handle = [IntPtr]::new([Int64]${hwnd})
-$rect = New-Object WechatContinuousNative+RECT
-if ([WechatContinuousNative]::IsIconic($handle)) { [WechatContinuousNative]::ShowWindowAsync($handle, 9) | Out-Null }
-[WechatContinuousNative]::SetForegroundWindow($handle) | Out-Null
-Start-Sleep -Milliseconds 80
-if (-not [WechatContinuousNative]::GetWindowRect($handle, [ref]$rect)) { throw 'Cannot read window bounds' }
-$x = [int]($rect.Left + ($rect.Right - $rect.Left) * ${xRatio.toFixed(4)})
-$y = [int]($rect.Top + ($rect.Bottom - $rect.Top) * ${yRatio.toFixed(4)})
-[WechatContinuousNative]::SetCursorPos($x, $y) | Out-Null
-`
-}
-
-function oneShotScrollScript(hwnd: string, crop: WechatContinuousCaptureRequest['crop'], direction: 'up' | 'down', steps: number): string {
-  const delta = direction === 'up' ? 120 : -120
-  return `${nativeScript(hwnd, crop)}
-$remaining = ${steps}
-while ($remaining -gt 0) {
-  $chunk = [Math]::Min(12, $remaining)
-  [WechatContinuousNative]::mouse_event(0x0800, 0, 0, ${delta} * $chunk, [UIntPtr]::Zero)
-  $remaining -= $chunk
-  if ($remaining -gt 0) { Start-Sleep -Milliseconds 8 }
-}
-`
-}
-
-function controlledScrollScript(hwnd: string, crop: WechatContinuousCaptureRequest['crop']): string {
-  return `${nativeScript(hwnd, crop)}
-while ($true) {
-  $command = [Console]::In.ReadLine()
-  if ($null -eq $command -or $command -eq 'quit') { break }
-  if ($command -ne 'scroll') { continue }
-  [WechatContinuousNative]::SetForegroundWindow($handle) | Out-Null
-  [WechatContinuousNative]::SetCursorPos($x, $y) | Out-Null
-  [WechatContinuousNative]::mouse_event(0x0800, 0, 0, -1440, [UIntPtr]::Zero)
-  [Console]::Out.WriteLine('ok')
-  [Console]::Out.Flush()
-}
-`
+function clampInt(value: number, minimum: number, maximum: number): number {
+  return Math.max(minimum, Math.min(maximum, Math.round(value)))
 }
 
 function delay(milliseconds: number): Promise<void> {

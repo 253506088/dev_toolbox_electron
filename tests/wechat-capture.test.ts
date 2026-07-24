@@ -2,10 +2,13 @@ import { describe, expect, it } from 'vitest'
 import {
   acceptedOverlapHeight,
   classifyCaptureOverlap,
+  computeBlankRows,
   continuousFrameDecision,
+  continuousOverlapSearchWindow,
   continuousSafeStripRegion,
   findVerticalOverlap,
-  normalizedImageDifference
+  normalizedImageDifference,
+  planScreenSlices
 } from '../src/shared/wechat-capture'
 
 describe('微信长截图图像匹配', () => {
@@ -52,7 +55,8 @@ describe('微信长截图图像匹配', () => {
   it('连续采集只追加可靠的小幅位移', () => {
     expect(continuousFrameDecision({ overlap: 150, score: 0.003 }, 800, 200)).toEqual({ kind: 'append', overlap: 600, shift: 200 })
     expect(continuousFrameDecision({ overlap: 199, score: 0.003 }, 800, 200)).toEqual({ kind: 'stationary', overlap: 796, shift: 4 })
-    expect(continuousFrameDecision({ overlap: 80, score: 0.003 }, 800, 200).kind).toBe('reject')
+    expect(continuousFrameDecision({ overlap: 80, score: 0.003 }, 800, 200).kind).toBe('append')
+    expect(continuousFrameDecision({ overlap: 75, score: 0.003 }, 800, 200).kind).toBe('reject')
     expect(continuousFrameDecision({ overlap: 150, score: 0.02 }, 800, 200).kind).toBe('append')
     expect(continuousFrameDecision({ overlap: 150, score: 0.03 }, 800, 200).kind).toBe('reject')
   })
@@ -95,5 +99,61 @@ describe('微信长截图图像匹配', () => {
     ]
     expect(stitched).toEqual(Array.from({ length: 12 }, (_, row) => row))
     expect(stitched).not.toContain(99)
+  })
+
+  it('围绕预期位移生成重叠搜索窗口', () => {
+    expect(continuousOverlapSearchWindow(800, 400)).toEqual({ minimumRatio: 0.4, maximumRatio: 0.6 })
+    expect(continuousOverlapSearchWindow(800, 0)).toBeNull()
+    expect(continuousOverlapSearchWindow(800, 900)).toBeNull()
+    expect(continuousOverlapSearchWindow(4, 2)).toBeNull()
+  })
+})
+
+describe('微信长截图智能分屏', () => {
+  it('识别接近背景色的空白行', () => {
+    const width = 8
+    const background = (): number[] => Array.from({ length: width }, () => 240)
+    const bubble = (): number[] => [240, 200, 60, 60, 200, 240, 240, 240]
+    const darkBand = (): number[] => Array.from({ length: width }, () => 30)
+    const rows = [background(), background(), bubble(), bubble(), darkBand(), background()]
+    const flags = computeBlankRows(Uint8Array.from(rows.flat()), width, rows.length)
+    expect(Array.from(flags)).toEqual([1, 1, 0, 0, 0, 1])
+  })
+
+  it('尺寸不符时返回全零标记', () => {
+    expect(Array.from(computeBlankRows(new Uint8Array(3), 2, 2))).toEqual([0, 0])
+  })
+
+  it('优先在目标切点附近的空白段中间下刀', () => {
+    const blank = new Uint8Array(1000)
+    for (let row = 380; row <= 390; row += 1) blank[row] = 1
+    const slices = planScreenSlices(blank, 400)
+    expect(slices).toEqual([
+      { top: 0, height: 385 },
+      { top: 385, height: 400 },
+      { top: 737, height: 263 }
+    ])
+    expect(slices[1].top + slices[1].height - slices[2].top).toBe(48)
+  })
+
+  it('没有空白行时按固定高度切割并保留重叠带', () => {
+    const slices = planScreenSlices(new Uint8Array(1010), 400)
+    expect(slices).toEqual([
+      { top: 0, height: 400 },
+      { top: 352, height: 400 },
+      { top: 704, height: 306 }
+    ])
+  })
+
+  it('全高不足一屏时输出单张分屏', () => {
+    expect(planScreenSlices(new Uint8Array(300), 400)).toEqual([{ top: 0, height: 300 }])
+    expect(planScreenSlices(new Uint8Array(0), 400)).toEqual([])
+  })
+
+  it('切点过于贴近末尾时并入前一屏，避免碎条', () => {
+    const blank = new Uint8Array(800)
+    for (let row = 790; row <= 795; row += 1) blank[row] = 1
+    const slices = planScreenSlices(blank, 700)
+    expect(slices).toEqual([{ top: 0, height: 800 }])
   })
 })

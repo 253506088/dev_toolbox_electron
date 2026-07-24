@@ -24,6 +24,17 @@ describe('文本转换核心', () => {
     expect(result).toContain('WHERE')
   })
 
+  it('识别 MyBatis 占位符和 JDBC 问号参数', () => {
+    const result = formatSqlText(
+      "select * from users where id = #{userId} and name like ${namePattern} and status = ? and created_at > #{query.beginTime}"
+    )
+    expect(result).toContain('#{userId}')
+    expect(result).toContain('${namePattern}')
+    expect(result).toContain('#{query.beginTime}')
+    expect(result).toContain('= ?')
+    expect(result).toContain('WHERE')
+  })
+
   it('把 SQL 压成单行', () => {
     expect(compressSql('SELECT  *\nFROM\tusers')).toBe('SELECT * FROM users')
   })

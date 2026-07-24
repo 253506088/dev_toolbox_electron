@@ -1,4 +1,3 @@
-import { spawn } from 'node:child_process'
 import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { app, desktopCapturer, globalShortcut, type WebContents } from 'electron'
@@ -13,6 +12,7 @@ import {
   type WechatCaptureStartResult,
   type WechatWindowSource
 } from '../../shared/wechat-capture'
+import { scrollChatToTop, WechatScrollController } from './wechat-scroll-controller'
 
 const CAPTURE_SIZE = { width: 1920, height: 1080 }
 const FINGERPRINT_WIDTH = 320
@@ -24,6 +24,7 @@ interface ActiveRun {
   cancelled: boolean
   sender: WebContents
   outputDirectory: string
+  scroller: WechatScrollController | null
 }
 
 interface CapturedFrame {
@@ -32,7 +33,6 @@ interface CapturedFrame {
   height: number
   fingerprint: Uint8Array
   fingerprintHeight: number
-  previewDataUrl: string
 }
 
 /** 抓取微信窗口、自动滚动，并产出分屏、长图和 Markdown。 */
@@ -45,7 +45,7 @@ export class WechatCaptureService {
 
   /** 列出名称疑似微信的窗口；没有命中时返回全部普通窗口供用户手选。 */
   async listWindows(): Promise<WechatWindowSource[]> {
-    const sources = await desktopCapturer.getSources({ types: ['window'], thumbnailSize: { width: 1600, height: 1000 } })
+    const sources = await desktopCapturer.getSources({ types: ['window'], thumbnailSize: { width: 1920, height: 1200 } })
     const mapped = sources
       .filter((source) => !source.thumbnail.isEmpty())
       .map((source) => {
@@ -68,7 +68,7 @@ export class WechatCaptureService {
     if (this.activeRun) throw new Error('已有截图任务正在运行')
     validateRequest(request)
     const outputDirectory = await this.createRunDirectory(request.outputDirectory, request.sourceName)
-    const run: ActiveRun = { id: crypto.randomUUID(), cancelled: false, sender, outputDirectory }
+    const run: ActiveRun = { id: crypto.randomUUID(), cancelled: false, sender, outputDirectory, scroller: null }
     this.activeRun = run
     if (!globalShortcut.register(STOP_HOTKEY, () => this.stop())) {
       this.activeRun = null
@@ -95,28 +95,23 @@ export class WechatCaptureService {
     const overlaps: number[] = []
     try {
       await Promise.all([mkdir(screenshotsDirectory, { recursive: true }), mkdir(longDirectory, { recursive: true })])
+      run.scroller = WechatScrollController.start(request.sourceId, request.crop)
       this.emit(run, 'positioning', '正在将聊天记录滚动到顶部...', 0)
-      let previous = await this.capture(request)
-      let stableCount = 0
-      const positioningDelay = Math.min(300, request.settleDelayMs)
-      for (let attempt = 0; attempt < 120 && stableCount < 3 && !run.cancelled; attempt += 1) {
-        this.assertSender(run)
-        await this.scroll(request.sourceId, request.crop, 'up', 80)
-        await delay(positioningDelay)
-        const current = await this.capture(request)
-        stableCount = normalizedImageDifference(previous.fingerprint, current.fingerprint) < 0.0035 ? stableCount + 1 : 0
-        previous = current
-        this.emit(run, 'positioning', `正在定位顶部${'.'.repeat((attempt % 3) + 1)}`, 0)
-      }
-      if (run.cancelled) {
+      const top = await scrollChatToTop({
+        controller: run.scroller,
+        capture: () => this.capture(request),
+        isCancelled: () => run.cancelled || run.sender.isDestroyed(),
+        onProgress: (burst) => this.emit(run, 'positioning', `正在定位顶部（第 ${burst + 1} 次翻页）...`, 0),
+        pollDelayMs: Math.min(120, Math.max(80, Math.round(request.settleDelayMs / 3)))
+      })
+      if (!top || run.cancelled) {
         this.emit(run, 'stopped', '截图已停止', 0)
         return
       }
-      if (stableCount < 3) throw new Error('未能确认聊天记录顶部，请检查截图区域是否覆盖聊天消息列表')
 
-      let frame = previous
+      let frame = top
       await this.saveScreen(frame.buffer, screenshotsDirectory, screenPaths, overlaps, 0)
-      this.emit(run, 'capturing', '已从顶部开始截图，按 Ctrl+E 可停止', screenPaths.length, frame.previewDataUrl)
+      this.emit(run, 'capturing', '已从顶部开始截图，按 Ctrl+E 可停止', screenPaths.length, await this.preview(frame.buffer))
 
       let unchangedCount = 0
       let reachedBottom = false
@@ -127,7 +122,7 @@ export class WechatCaptureService {
         let highOverlapCandidate: { frame: CapturedFrame; overlap: number } | null = null
 
         for (let attempt = 0; attempt < 12 && !run.cancelled; attempt += 1) {
-          await this.scroll(request.sourceId, request.crop, 'down', attempt === 0 ? request.scrollStep : 1)
+          await run.scroller.scroll(-(attempt === 0 ? request.scrollStep : 1))
           await delay(request.settleDelayMs)
           const next = await this.capture(request)
           const movement = normalizedImageDifference(lastObserved.fingerprint, next.fingerprint)
@@ -136,7 +131,7 @@ export class WechatCaptureService {
             if (highOverlapCandidate) {
               await this.saveScreen(highOverlapCandidate.frame.buffer, screenshotsDirectory, screenPaths, overlaps, highOverlapCandidate.overlap)
               frame = highOverlapCandidate.frame
-              this.emit(run, 'capturing', `正在抓取第 ${screenPaths.length} 屏，按 Ctrl+E 可停止`, screenPaths.length, frame.previewDataUrl)
+              this.emit(run, 'capturing', `正在抓取第 ${screenPaths.length} 屏，按 Ctrl+E 可停止`, screenPaths.length, await this.preview(frame.buffer))
               continue captureLoop
             }
             if (unchangedCount >= 2) {
@@ -160,7 +155,7 @@ export class WechatCaptureService {
           if (overlapDecision === 'save') {
             await this.saveScreen(next.buffer, screenshotsDirectory, screenPaths, overlaps, overlap)
             frame = next
-            this.emit(run, 'capturing', `正在抓取第 ${screenPaths.length} 屏，按 Ctrl+E 可停止`, screenPaths.length, next.previewDataUrl)
+            this.emit(run, 'capturing', `正在抓取第 ${screenPaths.length} 屏，按 Ctrl+E 可停止`, screenPaths.length, await this.preview(next.buffer))
             continue captureLoop
           }
 
@@ -173,14 +168,14 @@ export class WechatCaptureService {
             await this.saveScreen(next.buffer, screenshotsDirectory, screenPaths, overlaps, 0)
           }
           frame = next
-          this.emit(run, 'capturing', `正在抓取第 ${screenPaths.length} 屏，按 Ctrl+E 可停止`, screenPaths.length, next.previewDataUrl)
+          this.emit(run, 'capturing', `正在抓取第 ${screenPaths.length} 屏，按 Ctrl+E 可停止`, screenPaths.length, await this.preview(next.buffer))
           continue captureLoop
         }
 
         if (highOverlapCandidate && screenPaths.length < request.maxScreens) {
           await this.saveScreen(highOverlapCandidate.frame.buffer, screenshotsDirectory, screenPaths, overlaps, highOverlapCandidate.overlap)
           frame = highOverlapCandidate.frame
-          this.emit(run, 'capturing', `正在抓取第 ${screenPaths.length} 屏，按 Ctrl+E 可停止`, screenPaths.length, frame.previewDataUrl)
+          this.emit(run, 'capturing', `正在抓取第 ${screenPaths.length} 屏，按 Ctrl+E 可停止`, screenPaths.length, await this.preview(frame.buffer))
         }
       }
 
@@ -192,9 +187,14 @@ export class WechatCaptureService {
       const finalMessage = stopped ? '截图已停止，现有内容已保存' : reachedBottom ? '聊天记录截图已完成' : '已达到最大分屏数，现有内容已保存'
       this.emit(run, stopped ? 'stopped' : 'complete', finalMessage, screenPaths.length, undefined, markdownPath)
     } catch (error) {
-      const message = error instanceof Error ? error.message : String(error)
-      this.emit(run, 'error', message, screenPaths.length)
+      if (run.cancelled) {
+        this.emit(run, 'stopped', '截图已停止', screenPaths.length)
+      } else {
+        const message = error instanceof Error ? error.message : String(error)
+        this.emit(run, 'error', message, screenPaths.length)
+      }
     } finally {
+      await this.stopScroller(run)
       if (this.activeRun === run) this.activeRun = null
       globalShortcut.unregister(STOP_HOTKEY)
     }
@@ -210,33 +210,27 @@ export class WechatCaptureService {
     const region = cropToPixels(request.crop, metadata.width, metadata.height)
     const buffer = await image.extract(region).png().toBuffer()
     const fingerprintHeight = Math.max(24, Math.round(region.height * FINGERPRINT_WIDTH / region.width))
-    const [fingerprint, preview] = await Promise.all([
-      sharp(buffer).resize(FINGERPRINT_WIDTH, fingerprintHeight, { fit: 'fill' }).grayscale().raw().toBuffer(),
-      sharp(buffer).resize({ width: 240, withoutEnlargement: true }).png().toBuffer()
-    ])
+    const fingerprint = await sharp(buffer).resize(FINGERPRINT_WIDTH, fingerprintHeight, { fit: 'fill' }).grayscale().raw().toBuffer()
     return {
       buffer,
       width: region.width,
       height: region.height,
       fingerprint,
-      fingerprintHeight,
-      previewDataUrl: `data:image/png;base64,${preview.toString('base64')}`
+      fingerprintHeight
     }
   }
 
-  private async scroll(sourceId: string, crop: WechatCaptureRequest['crop'], direction: 'up' | 'down', steps: number): Promise<void> {
-    const hwnd = parseWindowHandle(sourceId)
-    if (!hwnd) throw new Error('无法识别微信窗口句柄')
-    const script = windowsScrollScript(hwnd, crop, direction, steps)
-    const encoded = Buffer.from(script, 'utf16le').toString('base64')
-    await new Promise<void>((resolve, reject) => {
-      const child = spawn('powershell.exe', ['-NoProfile', '-NonInteractive', '-EncodedCommand', encoded], { windowsHide: true })
-      let errorText = ''
-      child.stderr.setEncoding('utf8')
-      child.stderr.on('data', (chunk: string) => { errorText += chunk })
-      child.once('error', reject)
-      child.once('exit', (code) => code === 0 ? resolve() : reject(new Error(errorText.trim() || '无法控制微信窗口滚动')))
-    })
+  /** 预览图只在推送进度时生成，采样路径不再逐帧缩放编码。 */
+  private async preview(buffer: Buffer): Promise<string> {
+    const image = await sharp(buffer).resize({ width: 240, withoutEnlargement: true }).png().toBuffer()
+    return `data:image/png;base64,${image.toString('base64')}`
+  }
+
+  private async stopScroller(run: ActiveRun): Promise<void> {
+    const child = run.scroller
+    if (!child) return
+    run.scroller = null
+    await child.stop()
   }
 
   private async saveScreen(buffer: Buffer, directory: string, paths: string[], overlaps: number[], overlap: number): Promise<void> {
@@ -363,48 +357,6 @@ function cropToPixels(crop: WechatCaptureRequest['crop'], width: number, height:
   const right = Math.round(width * crop.right / 100)
   const bottom = Math.round(height * crop.bottom / 100)
   return { left, top, width: width - left - right, height: height - top - bottom }
-}
-
-function parseWindowHandle(sourceId: string): string | null {
-  const match = /^window:(\d+):/.exec(sourceId)
-  return match?.[1] ?? null
-}
-
-function windowsScrollScript(hwnd: string, crop: WechatCaptureRequest['crop'], direction: 'up' | 'down', steps: number): string {
-  const delta = direction === 'up' ? 120 : -120
-  const xRatio = (crop.left + (100 - crop.right)) / 200
-  const yRatio = (crop.top + (100 - crop.bottom)) / 200
-  return `
-Add-Type @'
-using System;
-using System.Runtime.InteropServices;
-public static class WechatCaptureNative {
-  [StructLayout(LayoutKind.Sequential)] public struct RECT { public int Left; public int Top; public int Right; public int Bottom; }
-  [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr hWnd, out RECT rect);
-  [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr hWnd);
-  [DllImport("user32.dll")] public static extern bool ShowWindowAsync(IntPtr hWnd, int command);
-  [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
-  [DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y);
-  [DllImport("user32.dll")] public static extern void mouse_event(uint flags, uint dx, uint dy, int data, UIntPtr extraInfo);
-}
-'@
-$handle = [IntPtr]::new([Int64]${hwnd})
-$rect = New-Object WechatCaptureNative+RECT
-if ([WechatCaptureNative]::IsIconic($handle)) { [WechatCaptureNative]::ShowWindowAsync($handle, 9) | Out-Null }
-[WechatCaptureNative]::SetForegroundWindow($handle) | Out-Null
-Start-Sleep -Milliseconds 80
-if (-not [WechatCaptureNative]::GetWindowRect($handle, [ref]$rect)) { throw 'Cannot read window bounds' }
-$x = [int]($rect.Left + ($rect.Right - $rect.Left) * ${xRatio.toFixed(4)})
-$y = [int]($rect.Top + ($rect.Bottom - $rect.Top) * ${yRatio.toFixed(4)})
-[WechatCaptureNative]::SetCursorPos($x, $y) | Out-Null
-$remaining = ${steps}
-while ($remaining -gt 0) {
-  $chunk = [Math]::Min(12, $remaining)
-  [WechatCaptureNative]::mouse_event(0x0800, 0, 0, ${delta} * $chunk, [UIntPtr]::Zero)
-  $remaining -= $chunk
-  if ($remaining -gt 0) { Start-Sleep -Milliseconds 8 }
-}
-`
 }
 
 function delay(milliseconds: number): Promise<void> {

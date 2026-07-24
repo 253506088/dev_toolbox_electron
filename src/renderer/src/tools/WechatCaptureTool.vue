@@ -1,10 +1,11 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, reactive, ref } from 'vue'
-import { Camera, FolderOpen, RefreshCw, Square, WandSparkles } from '@lucide/vue'
+import { computed, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
+import { Camera, FolderOpen, Maximize2, RefreshCw, Square, WandSparkles } from '@lucide/vue'
 import {
   NButton,
   NIcon,
   NInputNumber,
+  NModal,
   NProgress,
   NRadioButton,
   NRadioGroup,
@@ -14,6 +15,7 @@ import {
   useMessage
 } from 'naive-ui'
 import type { WechatCaptureCrop, WechatCaptureEvent, WechatCaptureMode, WechatWindowSource } from '@shared/wechat-capture'
+import CropSelector from '../components/CropSelector.vue'
 import ToolPage from '../components/ToolPage.vue'
 
 const message = useMessage()
@@ -25,27 +27,31 @@ const running = ref(false)
 const progress = ref<WechatCaptureEvent | null>(null)
 const captureMode = ref<WechatCaptureMode>('continuous')
 const crop = reactive<WechatCaptureCrop>({ left: 31, top: 9, right: 2, bottom: 25 })
+const zoomVisible = ref(false)
 const scrollStep = ref(2)
 const settleDelayMs = ref(350)
 const maxScreens = ref(300)
 const frameIntervalMs = ref(100)
-const scrollIntervalMs = ref(300)
+const scrollIntervalMs = ref(200)
 const maxFrames = ref(5000)
 let unsubscribe: (() => void) | undefined
-let selectionDrag: { x: number; y: number; initial: WechatCaptureCrop } | null = null
+
+const previewArea = ref<HTMLElement | null>(null)
+const previewAreaSize = reactive({ width: 0, height: 0 })
+let previewAreaObserver: ResizeObserver | undefined
 
 const selectedWindow = computed(() => windows.value.find((item) => item.id === selectedId.value) ?? null)
 const windowOptions = computed(() => windows.value.map((item) => ({ label: item.name, value: item.id })))
-const cropStyle = computed(() => ({
-  left: `${crop.left}%`,
-  top: `${crop.top}%`,
-  right: `${crop.right}%`,
-  bottom: `${crop.bottom}%`
-}))
-const previewAspect = computed(() => selectedWindow.value
-  ? `${selectedWindow.value.width} / ${selectedWindow.value.height}`
-  : '16 / 10')
 const isFinished = computed(() => progress.value?.stage === 'complete' || progress.value?.stage === 'stopped')
+
+/** 按可用区域和窗口宽高比取“contain”最大尺寸，让预览铺满工作区。 */
+const previewFitStyle = computed(() => {
+  const source = selectedWindow.value
+  if (!source || !source.height || previewAreaSize.width < 40 || previewAreaSize.height < 40) return { width: '100%' }
+  const aspect = source.width / source.height
+  const width = Math.min(previewAreaSize.width, previewAreaSize.height * aspect)
+  return { width: `${Math.max(40, Math.floor(width))}px` }
+})
 
 /** 刷新桌面窗口并优先选中第一个微信窗口。 */
 async function refreshWindows(): Promise<void> {
@@ -114,59 +120,29 @@ function openOutput(): void {
 }
 
 function resetCrop(): void {
-  Object.assign(crop, { left: 31, top: 9, right: 2, bottom: 25 })
+  applyCrop({ left: 31, top: 9, right: 2, bottom: 25 })
 }
 
-/** 在窗口预览上直接拖出新的聊天记录区域。 */
-function startSelection(event: PointerEvent): void {
-  if (running.value || event.button !== 0) return
-  const point = previewPoint(event)
-  selectionDrag = { ...point, initial: { ...crop } }
-  ;(event.currentTarget as HTMLElement).setPointerCapture(event.pointerId)
-}
-
-function updateSelection(event: PointerEvent): void {
-  if (!selectionDrag || running.value) return
-  const point = previewPoint(event)
-  const left = Math.min(selectionDrag.x, point.x)
-  const top = Math.min(selectionDrag.y, point.y)
-  const width = Math.abs(point.x - selectionDrag.x)
-  const height = Math.abs(point.y - selectionDrag.y)
-  if (width < 2 || height < 2) return
-  Object.assign(crop, {
-    left: roundPercent(left),
-    top: roundPercent(top),
-    right: roundPercent(100 - left - width),
-    bottom: roundPercent(100 - top - height)
-  })
-}
-
-function finishSelection(event: PointerEvent): void {
-  if (!selectionDrag) return
-  const initial = selectionDrag.initial
-  const point = previewPoint(event)
-  const width = Math.abs(point.x - selectionDrag.x)
-  const height = Math.abs(point.y - selectionDrag.y)
-  if (width < 5 || height < 5) Object.assign(crop, initial)
-  else updateSelection(event)
-  selectionDrag = null
-  const target = event.currentTarget as HTMLElement
-  if (target.hasPointerCapture(event.pointerId)) target.releasePointerCapture(event.pointerId)
-}
-
-function previewPoint(event: PointerEvent): { x: number; y: number } {
-  const rect = (event.currentTarget as HTMLElement).getBoundingClientRect()
-  return {
-    x: Math.min(100, Math.max(0, (event.clientX - rect.left) / rect.width * 100)),
-    y: Math.min(100, Math.max(0, (event.clientY - rect.top) / rect.height * 100))
-  }
-}
-
-function roundPercent(value: number): number {
-  return Math.round(value * 10) / 10
+/** 预览与放大弹窗共用的选区更新入口，保持与右侧滑块双向同步。 */
+function applyCrop(value: WechatCaptureCrop): void {
+  Object.assign(crop, value)
 }
 
 onMounted(async () => {
+  previewAreaObserver = new ResizeObserver((entries) => {
+    const rect = entries[0]?.contentRect
+    if (!rect) return
+    previewAreaSize.width = rect.width
+    previewAreaSize.height = rect.height
+  })
+  watch(
+    previewArea,
+    (element) => {
+      previewAreaObserver?.disconnect()
+      if (element) previewAreaObserver?.observe(element)
+    },
+    { immediate: true }
+  )
   unsubscribe = window.electronApi.wechatCapture.onEvent((event) => {
     progress.value = event
     running.value = !['complete', 'stopped', 'error'].includes(event.stage)
@@ -178,7 +154,10 @@ onMounted(async () => {
   await refreshWindows()
 })
 
-onUnmounted(() => unsubscribe?.())
+onUnmounted(() => {
+  unsubscribe?.()
+  previewAreaObserver?.disconnect()
+})
 
 function formatError(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
@@ -215,31 +194,26 @@ function formatError(error: unknown): string {
             :disabled="running"
             placeholder="选择微信窗口"
           />
+          <NButton :disabled="!selectedWindow" @click="zoomVisible = true">
+            <template #icon><NIcon :component="Maximize2" /></template>
+            放大调整
+          </NButton>
           <NTag v-if="running" type="warning" :bordered="false">Ctrl+E 停止</NTag>
           <NTag v-else-if="isFinished" type="success" :bordered="false">已保存</NTag>
         </div>
 
-        <div
-          v-if="selectedWindow"
-          class="window-preview"
-          :class="{ disabled: running }"
-          :style="{ aspectRatio: previewAspect }"
-          aria-label="拖拽选择聊天记录截图区域"
-          @pointerdown="startSelection"
-          @pointermove="updateSelection"
-          @pointerup="finishSelection"
-          @pointercancel="finishSelection"
-        >
-          <img :src="selectedWindow.thumbnailDataUrl" :alt="selectedWindow.name" draggable="false" />
-          <div class="crop-mask crop-mask-top" :style="{ height: `${crop.top}%` }" />
-          <div class="crop-mask crop-mask-bottom" :style="{ height: `${crop.bottom}%` }" />
-          <div class="crop-mask crop-mask-left" :style="{ top: `${crop.top}%`, bottom: `${crop.bottom}%`, width: `${crop.left}%` }" />
-          <div class="crop-mask crop-mask-right" :style="{ top: `${crop.top}%`, bottom: `${crop.bottom}%`, width: `${crop.right}%` }" />
-          <div class="crop-outline" :style="cropStyle">
-            <span>聊天记录区域</span>
-            <i class="handle handle-nw" /><i class="handle handle-ne" />
-            <i class="handle handle-sw" /><i class="handle handle-se" />
-          </div>
+        <div v-if="selectedWindow" ref="previewArea" class="preview-area">
+          <CropSelector
+            class="window-preview"
+            :style="previewFitStyle"
+            :crop="crop"
+            :image-url="selectedWindow.thumbnailDataUrl"
+            :alt="selectedWindow.name"
+            :disabled="running"
+            :source-width="selectedWindow.width"
+            :source-height="selectedWindow.height"
+            @update:crop="applyCrop"
+          />
         </div>
         <div v-else class="empty-preview">请打开微信聊天窗口后刷新</div>
 
@@ -306,6 +280,21 @@ function formatError(error: unknown): string {
         </NButton>
       </aside>
     </div>
+
+    <NModal v-model:show="zoomVisible" preset="card" title="放大调整截图区域" class="crop-zoom-modal">
+      <p class="zoom-hint">拖动边角或整体拖移调整；在框外拖拽可重新框选。选区与右侧参数实时同步。</p>
+      <CropSelector
+        v-if="selectedWindow"
+        class="zoom-crop"
+        :crop="crop"
+        :image-url="selectedWindow.thumbnailDataUrl"
+        :alt="selectedWindow.name"
+        :disabled="running"
+        :source-width="selectedWindow.width"
+        :source-height="selectedWindow.height"
+        @update:crop="applyCrop"
+      />
+    </NModal>
   </ToolPage>
 </template>
 
@@ -314,21 +303,8 @@ function formatError(error: unknown): string {
 .capture-workspace { display: flex; flex-direction: column; min-width: 0; min-height: 0; gap: 12px; }
 .source-row { display: flex; align-items: center; min-height: 34px; gap: 10px; }
 .source-row :deep(.n-select) { min-width: 240px; max-width: 520px; }
-.window-preview { position: relative; width: min(100%, 1100px); max-height: calc(100% - 128px); margin: auto; overflow: hidden; border: 1px solid var(--border-color); border-radius: 5px; background: #17191c; cursor: crosshair; touch-action: none; user-select: none; }
-.window-preview.disabled { cursor: not-allowed; }
-.window-preview img { display: block; width: 100%; height: 100%; object-fit: fill; pointer-events: none; user-select: none; }
-.crop-mask { position: absolute; z-index: 1; background: rgb(8 10 12 / 62%); pointer-events: none; }
-.crop-mask-top { inset: 0 0 auto; }
-.crop-mask-bottom { inset: auto 0 0; }
-.crop-mask-left { left: 0; }
-.crop-mask-right { right: 0; }
-.crop-outline { position: absolute; z-index: 2; border: 2px solid #18a058; box-shadow: inset 0 0 0 1px rgb(255 255 255 / 50%); pointer-events: none; }
-.crop-outline span { position: absolute; top: 6px; left: 7px; padding: 3px 6px; border-radius: 3px; color: #fff; background: #168653; font-size: var(--ui-font-xs); }
-.handle { position: absolute; width: 9px; height: 9px; border: 1px solid #fff; background: #18a058; }
-.handle-nw { top: -5px; left: -5px; }
-.handle-ne { top: -5px; right: -5px; }
-.handle-sw { bottom: -5px; left: -5px; }
-.handle-se { right: -5px; bottom: -5px; }
+.preview-area { display: flex; flex: 1; align-items: center; justify-content: center; min-width: 0; min-height: 0; }
+.window-preview { flex: none; }
 .empty-preview { display: grid; flex: 1; place-items: center; min-height: 300px; color: var(--text-muted); border: 1px dashed var(--border-color); border-radius: 5px; }
 .capture-status { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; min-height: 54px; gap: 10px; padding-top: 10px; border-top: 1px solid var(--border-color); }
 .capture-status > div { display: flex; justify-content: space-between; gap: 16px; }
@@ -346,5 +322,8 @@ function formatError(error: unknown): string {
 .path-button:hover:not(:disabled) { border-color: var(--accent-color); }
 .path-button:disabled { cursor: not-allowed; opacity: .55; }
 .path-button span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-@media (max-width: 1050px) { .wechat-capture-layout { grid-template-columns: 1fr; overflow: auto; } .capture-controls { border-left: 0; border-top: 1px solid var(--border-color); padding: 14px 0; } .window-preview { max-height: none; } }
+.crop-zoom-modal { width: min(96vw, 1560px); }
+.crop-zoom-modal .zoom-hint { margin: 0 0 10px; color: var(--text-muted); font-size: var(--ui-font-sm); }
+.crop-zoom-modal .zoom-crop { width: min(100%, 150vh); margin: 0 auto; }
+@media (max-width: 1050px) { .wechat-capture-layout { grid-template-columns: 1fr; overflow: auto; } .capture-controls { border-left: 0; border-top: 1px solid var(--border-color); padding: 14px 0; } .preview-area { min-height: 55vh; } }
 </style>

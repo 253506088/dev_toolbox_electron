@@ -49,6 +49,8 @@ onMounted(() => {
     fontSize: settingsStore.editorFontSize,
     lineHeight: 0,
     mouseWheelZoom: true,
+    mouseWheelScrollSensitivity: 3,
+    fastScrollSensitivity: 7,
     lineNumbers: 'on',
     minimap: { enabled: false },
     overviewRulerLanes: 0,

@@ -61,6 +61,8 @@ export function executeTextOperation(operation: TextOperation, input: string): s
 
 /**
  * 使用成熟格式化器整理 SQL，并统一为大写关键字和两个空格缩进。
+ * 通过自定义参数类型识别 MyBatis 的 #{...} / ${...} 占位符，避免解析报错；
+ * positional 显式保留 JDBC 风格的 ? 参数。
  */
 export function formatSqlText(input: string): string {
   if (!input.trim()) return ''
@@ -68,7 +70,11 @@ export function formatSqlText(input: string): string {
     language: 'sql',
     keywordCase: 'upper',
     tabWidth: 2,
-    linesBetweenQueries: 2
+    linesBetweenQueries: 2,
+    paramTypes: {
+      positional: true,
+      custom: [{ regex: String.raw`[#$]\{[^{}]*\}` }]
+    }
   })
 }
 

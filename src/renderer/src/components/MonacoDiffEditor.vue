@@ -45,6 +45,8 @@ onMounted(() => {
     fontSize: settingsStore.editorFontSize,
     lineHeight: 0,
     mouseWheelZoom: true,
+    mouseWheelScrollSensitivity: 3,
+    fastScrollSensitivity: 7,
     renderSideBySide: props.renderSideBySide,
     ignoreTrimWhitespace: props.ignoreTrimWhitespace,
     renderIndicators: true,
