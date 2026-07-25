@@ -3,6 +3,7 @@ import { computed, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
 import { Camera, FolderOpen, Maximize2, RefreshCw, Square, WandSparkles } from '@lucide/vue'
 import {
   NButton,
+  NCheckbox,
   NIcon,
   NInputNumber,
   NModal,
@@ -17,6 +18,7 @@ import {
 import type { WechatCaptureCrop, WechatCaptureEvent, WechatCaptureMode, WechatWindowSource } from '@shared/wechat-capture'
 import CropSelector from '../components/CropSelector.vue'
 import ToolPage from '../components/ToolPage.vue'
+import WechatExportTools from '../components/WechatExportTools.vue'
 
 const message = useMessage()
 const windows = ref<WechatWindowSource[]>([])
@@ -28,6 +30,7 @@ const progress = ref<WechatCaptureEvent | null>(null)
 const captureMode = ref<WechatCaptureMode>('continuous')
 const crop = reactive<WechatCaptureCrop>({ left: 31, top: 9, right: 2, bottom: 25 })
 const zoomVisible = ref(false)
+const startFromTop = ref(true)
 const scrollStep = ref(2)
 const settleDelayMs = ref(350)
 const maxScreens = ref(300)
@@ -83,7 +86,8 @@ async function startCapture(): Promise<void> {
       sourceId: selectedWindow.value.id,
       sourceName: selectedWindow.value.name,
       outputDirectory: outputDirectory.value,
-      crop: { ...crop }
+      crop: { ...crop },
+      startFromTop: startFromTop.value
     }
     const result = captureMode.value === 'continuous'
       ? await window.electronApi.wechatCapture.startContinuous({
@@ -253,6 +257,8 @@ function formatError(error: unknown): string {
 
         <div class="control-divider" />
         <h2>{{ captureMode === 'continuous' ? '连续采集参数' : '抓取参数' }}</h2>
+        <NCheckbox v-model:checked="startFromTop" :disabled="running">先回到聊天顶部再开始</NCheckbox>
+        <p class="option-hint">取消勾选则从当前位置向下截到底部</p>
         <template v-if="captureMode === 'continuous'">
           <div class="number-grid">
             <label>采样间隔<NInputNumber v-model:value="frameIntervalMs" :min="80" :max="1000" :step="20" :disabled="running" /></label>
@@ -278,6 +284,10 @@ function formatError(error: unknown): string {
           <template #icon><NIcon :component="FolderOpen" /></template>
           打开输出目录
         </NButton>
+
+        <div class="control-divider" />
+        <h2>后处理</h2>
+        <WechatExportTools />
       </aside>
     </div>
 
@@ -317,6 +327,7 @@ function formatError(error: unknown): string {
 .capture-controls > label, .number-grid label { display: flex; flex-direction: column; gap: 5px; color: var(--text-muted); font-size: var(--ui-font-sm); font-weight: 700; }
 .control-heading { display: flex; align-items: center; justify-content: space-between; }
 .control-divider { height: 1px; margin: 5px 0; background: var(--border-color); }
+.option-hint { margin: -4px 0 0; color: var(--text-muted); font-size: var(--ui-font-xs); }
 .number-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
 .path-button { display: flex; align-items: center; width: 100%; min-height: 36px; gap: 8px; padding: 6px 10px; border: 1px solid var(--border-color); border-radius: 4px; color: var(--text-color); background: transparent; cursor: pointer; }
 .path-button:hover:not(:disabled) { border-color: var(--accent-color); }

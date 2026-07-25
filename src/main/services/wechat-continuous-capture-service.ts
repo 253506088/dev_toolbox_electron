@@ -154,8 +154,15 @@ export class WechatContinuousCaptureService {
         mkdir(screenshotsDirectory, { recursive: true })
       ])
       run.scroller = WechatScrollController.start(request.sourceId, request.crop)
-      this.emit(run, 'positioning', '连续长截图：正在快速定位聊天顶部...', 0, 0)
-      const first = await this.positionAtTop(run, request)
+      const startFromTop = request.startFromTop !== false
+      this.emit(
+        run,
+        'positioning',
+        startFromTop ? '连续长截图：正在快速定位聊天顶部...' : '连续长截图：从当前位置开始采集...',
+        0,
+        0
+      )
+      const first = startFromTop ? await this.positionAtTop(run, request) : await this.captureStartFrame(run, request)
       if (!first || run.cancelled) {
         this.emit(run, 'stopped', '连续长截图已停止', 0, 0)
         return
@@ -322,6 +329,7 @@ export class WechatContinuousCaptureService {
         mode: 'continuous',
         sourceName: request.sourceName,
         crop: request.crop,
+        startFromTop: request.startFromTop !== false,
         frameIntervalMs: request.frameIntervalMs,
         scrollIntervalMs: request.scrollIntervalMs,
         capturedHeight,
@@ -378,6 +386,15 @@ export class WechatContinuousCaptureService {
         this.emit(run, 'positioning', `连续长截图：正在快速定位顶部（第 ${burst + 1} 次翻页）...`, 0, 0),
       pollDelayMs: Math.min(120, request.frameIntervalMs)
     })
+  }
+
+  /** 不回顶模式：等画面停稳后把当前内容作为长图起点。 */
+  private async captureStartFrame(run: ContinuousRun, request: WechatContinuousCaptureRequest): Promise<ContinuousFrame | null> {
+    const settled = await waitForStillFrame(() => this.capture(request), () => run.cancelled, {
+      pollDelayMs: Math.min(120, request.frameIntervalMs),
+      timeoutMs: 1000
+    })
+    return run.cancelled ? null : settled.frame
   }
 
   private async capture(request: WechatContinuousCaptureRequest): Promise<ContinuousFrame> {

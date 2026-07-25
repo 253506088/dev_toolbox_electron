@@ -8,6 +8,7 @@ import { registerNotesIpc } from './ipc/notes-ipc'
 import { registerTextIpc } from './ipc/text-ipc'
 import { registerUtilityIpc } from './ipc/utility-ipc'
 import { registerWechatCaptureIpc } from './ipc/wechat-capture-ipc'
+import { registerWechatExportIpc } from './ipc/wechat-export-ipc'
 import { DictionaryService } from './services/dictionary-service'
 import { FileService } from './services/file-service'
 import { FolderSizePool } from './services/folder-size-pool'
@@ -20,6 +21,7 @@ import { ImageService } from './services/image-service'
 import { MediaSourceService } from './services/media-source-service'
 import { WechatCaptureService } from './services/wechat-capture-service'
 import { WechatContinuousCaptureService } from './services/wechat-continuous-capture-service'
+import { WechatExportService } from './services/wechat-export-service'
 
 protocol.registerSchemesAsPrivileged([
   { scheme: 'note-image', privileges: { standard: true, secure: true, supportFetchAPI: true } },
@@ -32,6 +34,7 @@ let batchTasks: BatchTaskService | null = null
 let ffmpegService: FfmpegService | null = null
 let wechatCapture: WechatCaptureService | null = null
 let wechatContinuousCapture: WechatContinuousCaptureService | null = null
+let wechatExport: WechatExportService | null = null
 
 /** 创建应用主窗口，并限制网页只能在系统浏览器中打开外部链接。 */
 function createWindow(): void {
@@ -86,6 +89,7 @@ async function bootstrap(): Promise<void> {
   ffmpegService = new FfmpegService(mediaSources)
   wechatCapture = new WechatCaptureService()
   wechatContinuousCapture = new WechatContinuousCaptureService()
+  wechatExport = new WechatExportService()
   await notes.initialize()
   registerTextIpc()
   registerNotesIpc(notes, holidays)
@@ -94,6 +98,7 @@ async function bootstrap(): Promise<void> {
   registerDictionaryIpc(dictionary)
   registerMediaIpc(images, batchTasks, ffmpegService)
   registerWechatCaptureIpc(wechatCapture, wechatContinuousCapture)
+  registerWechatExportIpc(wechatExport)
   registerNoteImageProtocol(notes)
   mediaSources.registerProtocol()
   createWindow()
@@ -115,6 +120,7 @@ app.on('before-quit', () => {
   ffmpegService?.stopAll()
   wechatCapture?.dispose()
   wechatContinuousCapture?.dispose()
+  wechatExport?.dispose()
 })
 
 app.on('window-all-closed', () => {

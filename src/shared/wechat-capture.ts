@@ -24,6 +24,8 @@ export interface WechatCaptureRequest {
   scrollStep: number
   settleDelayMs: number
   maxScreens: number
+  /** 为 false 时不回顶，从当前位置向下截到底部；缺省按 true 处理。 */
+  startFromTop?: boolean
 }
 
 /** 连续长截图节点使用的采样和滚动参数。 */
@@ -35,6 +37,8 @@ export interface WechatContinuousCaptureRequest {
   frameIntervalMs: number
   scrollIntervalMs: number
   maxFrames: number
+  /** 为 false 时不回顶，从当前位置向下截到底部；缺省按 true 处理。 */
+  startFromTop?: boolean
 }
 
 export type WechatCaptureMode = 'paged' | 'continuous'

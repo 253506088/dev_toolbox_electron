@@ -198,6 +198,32 @@ export interface ElectronApi {
     /** 监听截图进度。 */
     onEvent(callback: (event: WechatCaptureEvent) => void): () => void
   }
+  wechatExport: {
+    /** 选择截图 Markdown 文件。 */
+    pickMarkdown(): Promise<string | null>
+    /** 选择 PDF 文件。 */
+    pickPdf(): Promise<string | null>
+    /** 选择图片目录。 */
+    pickDirectory(): Promise<string | null>
+    /** 把截图 Markdown 转成体积可控的 PDF。 */
+    markdownToPdf(request: WechatMarkdownToPdfRequest): Promise<WechatMarkdownToPdfResult>
+    /** 批量压缩指定目录的图片。 */
+    slimImages(request: WechatSlimImagesRequest): Promise<WechatSlimImagesResult>
+    /** 开始 PDF OCR 会话，返回 PDF 字节供渲染层光栅化。 */
+    ocrBegin(pdfPath: string): Promise<WechatOcrBeginResult & { pdfData: Uint8Array }>
+    /** 图片目录 OCR：主进程后台执行，进度与结果走事件。 */
+    ocrDirectoryStart(request: WechatOcrDirectoryRequest): Promise<WechatOcrDirectoryStartResult>
+    /** 提交一页光栅化图像做版面分析和 OCR。 */
+    ocrPage(sessionId: string, pageIndex: number, png: Uint8Array): Promise<WechatOcrPageResult>
+    /** 汇总生成聊天文稿。 */
+    ocrFinish(sessionId: string): Promise<WechatOcrFinishResult>
+    /** 取消 OCR 会话。 */
+    ocrCancel(sessionId: string): Promise<void>
+    /** 在文件管理器中显示生成的文件。 */
+    revealPath(path: string): Promise<void>
+    /** 监听后处理进度。 */
+    onEvent(callback: (event: WechatExportEvent) => void): () => void
+  }
   dictionary: {
     /** 读取合并后的 SD 词典。 */
     load(): Promise<DictionarySnapshot>
@@ -222,3 +248,15 @@ import type {
   WechatContinuousCaptureRequest,
   WechatWindowSource
 } from './wechat-capture'
+import type {
+  WechatExportEvent,
+  WechatMarkdownToPdfRequest,
+  WechatMarkdownToPdfResult,
+  WechatOcrBeginResult,
+  WechatOcrDirectoryRequest,
+  WechatOcrDirectoryStartResult,
+  WechatOcrFinishResult,
+  WechatOcrPageResult,
+  WechatSlimImagesRequest,
+  WechatSlimImagesResult
+} from './wechat-export'

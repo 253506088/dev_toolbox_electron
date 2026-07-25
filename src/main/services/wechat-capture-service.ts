@@ -96,14 +96,17 @@ export class WechatCaptureService {
     try {
       await Promise.all([mkdir(screenshotsDirectory, { recursive: true }), mkdir(longDirectory, { recursive: true })])
       run.scroller = WechatScrollController.start(request.sourceId, request.crop)
-      this.emit(run, 'positioning', '正在将聊天记录滚动到顶部...', 0)
-      const top = await scrollChatToTop({
-        controller: run.scroller,
-        capture: () => this.capture(request),
-        isCancelled: () => run.cancelled || run.sender.isDestroyed(),
-        onProgress: (burst) => this.emit(run, 'positioning', `正在定位顶部（第 ${burst + 1} 次翻页）...`, 0),
-        pollDelayMs: Math.min(120, Math.max(80, Math.round(request.settleDelayMs / 3)))
-      })
+      const startFromTop = request.startFromTop !== false
+      this.emit(run, 'positioning', startFromTop ? '正在将聊天记录滚动到顶部...' : '从当前位置开始截图...', 0)
+      const top = startFromTop
+        ? await scrollChatToTop({
+            controller: run.scroller,
+            capture: () => this.capture(request),
+            isCancelled: () => run.cancelled || run.sender.isDestroyed(),
+            onProgress: (burst) => this.emit(run, 'positioning', `正在定位顶部（第 ${burst + 1} 次翻页）...`, 0),
+            pollDelayMs: Math.min(120, Math.max(80, Math.round(request.settleDelayMs / 3)))
+          })
+        : await this.capture(request)
       if (!top || run.cancelled) {
         this.emit(run, 'stopped', '截图已停止', 0)
         return

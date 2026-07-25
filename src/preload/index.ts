@@ -9,6 +9,7 @@ import type {
 import type { BatchTaskEvent } from '../shared/batch-task'
 import type { MediaJobEvent } from '../shared/media-api'
 import type { WechatCaptureEvent } from '../shared/wechat-capture'
+import type { WechatExportEvent } from '../shared/wechat-export'
 
 /** 订阅一个白名单 IPC 事件，并返回取消订阅函数。 */
 function subscribe<T>(channel: string, callback: (payload: T) => void): () => void {
@@ -58,6 +59,20 @@ const api: ElectronApi = {
     stop: () => ipcRenderer.invoke('wechat-capture:stop'),
     openOutput: (path) => ipcRenderer.invoke('wechat-capture:open-output', path),
     onEvent: (callback) => subscribe<WechatCaptureEvent>('wechat-capture:event', callback)
+  },
+  wechatExport: {
+    pickMarkdown: () => ipcRenderer.invoke('wechat-export:pick-markdown'),
+    pickPdf: () => ipcRenderer.invoke('wechat-export:pick-pdf'),
+    pickDirectory: () => ipcRenderer.invoke('wechat-export:pick-directory'),
+    markdownToPdf: (request) => ipcRenderer.invoke('wechat-export:markdown-to-pdf', request),
+    slimImages: (request) => ipcRenderer.invoke('wechat-export:slim-images', request),
+    ocrBegin: (pdfPath) => ipcRenderer.invoke('wechat-export:ocr-begin', pdfPath),
+    ocrDirectoryStart: (request) => ipcRenderer.invoke('wechat-export:ocr-directory', request),
+    ocrPage: (sessionId, pageIndex, png) => ipcRenderer.invoke('wechat-export:ocr-page', sessionId, pageIndex, png),
+    ocrFinish: (sessionId) => ipcRenderer.invoke('wechat-export:ocr-finish', sessionId),
+    ocrCancel: (sessionId) => ipcRenderer.invoke('wechat-export:ocr-cancel', sessionId),
+    revealPath: (path) => ipcRenderer.invoke('wechat-export:reveal-path', path),
+    onEvent: (callback) => subscribe<WechatExportEvent>('wechat-export:event', callback)
   },
   dictionary: {
     load: () => ipcRenderer.invoke('dictionary:load'),
