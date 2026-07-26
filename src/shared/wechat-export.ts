@@ -32,7 +32,23 @@ export interface WechatSlimImagesResult {
   outputBytes: number
 }
 
+/** OCR 引擎：本地 Windows OCR 或 DeepSeek-OCR（OpenAI 兼容 API）。 */
+export type WechatOcrEngine = 'windows' | 'deepseek'
+
+/** DeepSeek-OCR 接入配置（OpenAI 兼容 chat/completions）。apiKey 可为空——本地 Ollama / vLLM 不需要。 */
+export interface WechatDeepseekOcrConfig {
+  baseUrl: string
+  apiKey: string
+  model: string
+}
+
 /** PDF OCR 会话。 */
+export interface WechatOcrBeginRequest {
+  pdfPath: string
+  engine: WechatOcrEngine
+  deepseek?: WechatDeepseekOcrConfig
+}
+
 export interface WechatOcrBeginResult {
   sessionId: string
 }
@@ -50,6 +66,8 @@ export interface WechatOcrFinishResult {
 /** 图片目录 OCR：主进程后台执行，进度与结果通过事件推送。 */
 export interface WechatOcrDirectoryRequest {
   directory: string
+  engine: WechatOcrEngine
+  deepseek?: WechatDeepseekOcrConfig
 }
 
 export interface WechatOcrDirectoryStartResult {

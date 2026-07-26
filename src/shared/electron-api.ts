@@ -210,7 +210,7 @@ export interface ElectronApi {
     /** 批量压缩指定目录的图片。 */
     slimImages(request: WechatSlimImagesRequest): Promise<WechatSlimImagesResult>
     /** 开始 PDF OCR 会话，返回 PDF 字节供渲染层光栅化。 */
-    ocrBegin(pdfPath: string): Promise<WechatOcrBeginResult & { pdfData: Uint8Array }>
+    ocrBegin(request: WechatOcrBeginRequest): Promise<WechatOcrBeginResult & { pdfData: Uint8Array }>
     /** 图片目录 OCR：主进程后台执行，进度与结果走事件。 */
     ocrDirectoryStart(request: WechatOcrDirectoryRequest): Promise<WechatOcrDirectoryStartResult>
     /** 提交一页光栅化图像做版面分析和 OCR。 */
@@ -252,6 +252,7 @@ import type {
   WechatExportEvent,
   WechatMarkdownToPdfRequest,
   WechatMarkdownToPdfResult,
+  WechatOcrBeginRequest,
   WechatOcrBeginResult,
   WechatOcrDirectoryRequest,
   WechatOcrDirectoryStartResult,

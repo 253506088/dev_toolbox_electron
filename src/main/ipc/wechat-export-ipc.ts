@@ -1,5 +1,10 @@
 import { dialog, ipcMain, shell } from 'electron'
-import type { WechatMarkdownToPdfRequest, WechatOcrDirectoryRequest, WechatSlimImagesRequest } from '../../shared/wechat-export'
+import type {
+  WechatMarkdownToPdfRequest,
+  WechatOcrBeginRequest,
+  WechatOcrDirectoryRequest,
+  WechatSlimImagesRequest
+} from '../../shared/wechat-export'
 import type { WechatExportService } from '../services/wechat-export-service'
 
 /** 注册微信截图后处理接口：MD 转 PDF、图片瘦身、PDF OCR。 */
@@ -30,7 +35,7 @@ export function registerWechatExportIpc(service: WechatExportService): void {
   ipcMain.handle('wechat-export:slim-images', (event, request: WechatSlimImagesRequest) =>
     service.slimImages(request, event.sender)
   )
-  ipcMain.handle('wechat-export:ocr-begin', (event, pdfPath: string) => service.ocrBegin(pdfPath, event.sender))
+  ipcMain.handle('wechat-export:ocr-begin', (event, request: WechatOcrBeginRequest) => service.ocrBegin(request, event.sender))
   ipcMain.handle('wechat-export:ocr-directory', (event, request: WechatOcrDirectoryRequest) =>
     service.ocrDirectoryStart(request, event.sender)
   )

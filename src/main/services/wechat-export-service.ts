@@ -7,16 +7,19 @@ import type {
   WechatExportEvent,
   WechatMarkdownToPdfRequest,
   WechatMarkdownToPdfResult,
+  WechatOcrBeginRequest,
   WechatOcrBeginResult,
   WechatOcrDirectoryRequest,
   WechatOcrDirectoryStartResult,
+  WechatOcrEngine,
   WechatOcrFinishResult,
   WechatOcrPageResult,
   WechatSlimImagesRequest,
   WechatSlimImagesResult
 } from '../../shared/wechat-export'
-import { assembleTranscript, buildPageMessages, segmentChatPage, type ChatMessage } from '../../shared/wechat-transcript'
+import { assembleTranscript, buildPageMessages, segmentChatPage, type ChatMessage, type OcrWord } from '../../shared/wechat-transcript'
 import { WechatOcrController } from './wechat-ocr-controller'
+import { DeepseekOcrClient, validateDeepseekConfig } from './wechat-dsocr-client'
 
 const OCR_MAX_DIMENSION = 2400
 /** 识别前把过小的图放大到该宽度附近，Windows OCR 对更大的字号明显更准。 */
@@ -27,7 +30,9 @@ interface OcrSession {
   id: string
   sourcePath: string
   tempDir: string
-  controller: WechatOcrController
+  engine: WechatOcrEngine
+  controller: WechatOcrController | null
+  deepseekClient: DeepseekOcrClient | null
   pages: Map<number, ChatMessage[]>
   cancelled: boolean
   sender: WebContents | null
@@ -160,10 +165,10 @@ export class WechatExportService {
   }
 
   /** 开始一次 PDF OCR 会话，返回会话 ID 和 PDF 原始字节（供渲染层用 pdfjs 逐页光栅化）。 */
-  async ocrBegin(pdfPath: string, sender: WebContents): Promise<WechatOcrBeginResult & { pdfData: Uint8Array }> {
-    if (typeof pdfPath !== 'string' || !/\.pdf$/i.test(pdfPath)) throw new Error('请选择 PDF 文件')
-    const pdfData = await readFile(pdfPath)
-    const session = await this.createSession(pdfPath, sender, true)
+  async ocrBegin(request: WechatOcrBeginRequest, sender: WebContents): Promise<WechatOcrBeginResult & { pdfData: Uint8Array }> {
+    if (typeof request?.pdfPath !== 'string' || !/\.pdf$/i.test(request.pdfPath)) throw new Error('请选择 PDF 文件')
+    const pdfData = await readFile(request.pdfPath)
+    const session = await this.createSession(request.pdfPath, sender, true, request.engine, request.deepseek)
     return { sessionId: session.id, pdfData: new Uint8Array(pdfData) }
   }
 
@@ -176,7 +181,7 @@ export class WechatExportService {
       .map((entry) => join(request.directory, entry.name))
       .sort()
     if (files.length === 0) throw new Error('目录中没有可识别的图片（支持 png/jpg/webp）')
-    const session = await this.createSession(request.directory, sender, false)
+    const session = await this.createSession(request.directory, sender, false, request.engine, request.deepseek)
     void this.executeDirectoryOcr(session, files, sender)
     return { runId: session.id, fileCount: files.length }
   }
@@ -251,8 +256,19 @@ export class WechatExportService {
       avatarMaxSize: Math.round(52 * effectiveFactor),
       mediaMinSize: Math.round(56 * effectiveFactor)
     })
-    const words = await session.controller.recognize(pagePath)
+    const words = await this.recognizeWords(session, pagePath, info.width, info.height)
     return buildPageMessages(regions, words, info.width)
+  }
+
+  /** 按会话选择的引擎识别词框：本地 Windows OCR 或 DeepSeek-OCR API。 */
+  private async recognizeWords(session: OcrSession, pagePath: string, width: number, height: number): Promise<OcrWord[]> {
+    if (session.engine === 'deepseek') {
+      if (!session.deepseekClient) throw new Error('DeepSeek-OCR 客户端未初始化')
+      const jpeg = await sharp(pagePath).flatten({ background: '#ffffff' }).jpeg({ quality: 90 }).toBuffer()
+      return session.deepseekClient.recognize(jpeg, width, height)
+    }
+    if (!session.controller) throw new Error('本地 OCR 进程未启动')
+    return session.controller.recognize(pagePath)
   }
 
   /** 汇总所有页并写出文稿。 */
@@ -289,13 +305,23 @@ export class WechatExportService {
   }
 
   /** 创建 OCR 会话；期间阻止系统休眠，PDF 模式还会关闭渲染进程后台节流，避免最小化后停摆。 */
-  private async createSession(sourcePath: string, sender: WebContents, disableThrottling: boolean): Promise<OcrSession> {
+  private async createSession(
+    sourcePath: string,
+    sender: WebContents,
+    disableThrottling: boolean,
+    engine: WechatOcrEngine = 'windows',
+    deepseekConfig?: WechatOcrBeginRequest['deepseek']
+  ): Promise<OcrSession> {
+    const resolvedEngine: WechatOcrEngine = engine === 'deepseek' ? 'deepseek' : 'windows'
+    const deepseekClient = resolvedEngine === 'deepseek' ? new DeepseekOcrClient(validateDeepseekConfig(deepseekConfig)) : null
     const tempDir = await mkdtemp(join(tmpdir(), 'wechat-ocr-'))
     const session: OcrSession = {
       id: crypto.randomUUID(),
       sourcePath,
       tempDir,
-      controller: WechatOcrController.start(),
+      engine: resolvedEngine,
+      controller: resolvedEngine === 'windows' ? WechatOcrController.start() : null,
+      deepseekClient,
       pages: new Map(),
       cancelled: false,
       sender,
@@ -318,7 +344,7 @@ export class WechatExportService {
       session.sender.setBackgroundThrottling(true)
       session.throttlingDisabled = false
     }
-    await session.controller.stop()
+    if (session.controller) await session.controller.stop()
     await rm(session.tempDir, { recursive: true, force: true }).catch(() => undefined)
   }
 

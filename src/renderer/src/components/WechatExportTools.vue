@@ -5,6 +5,7 @@ import {
   NButton,
   NCheckbox,
   NIcon,
+  NInput,
   NInputNumber,
   NModal,
   NProgress,
@@ -12,7 +13,7 @@ import {
   NRadioGroup,
   useMessage
 } from 'naive-ui'
-import type { WechatExportEvent } from '@shared/wechat-export'
+import type { WechatDeepseekOcrConfig, WechatExportEvent, WechatOcrEngine } from '@shared/wechat-export'
 
 const message = useMessage()
 let unsubscribe: (() => void) | undefined
@@ -40,6 +41,23 @@ const slimResultPath = ref('')
 // —— OCR 转文稿 ——
 const ocrVisible = ref(false)
 const ocrMode = ref<'directory' | 'pdf'>('directory')
+const ocrEngine = ref<WechatOcrEngine>('windows')
+const dsBaseUrl = ref('http://127.0.0.1:11434/v1')
+const dsModel = ref('deepseek-ocr')
+const dsApiKey = ref('')
+const DS_STORAGE_KEY = 'wechat-export.deepseek-ocr'
+const DS_PRESETS = {
+  ollama: { baseUrl: 'http://127.0.0.1:11434/v1', model: 'deepseek-ocr', apiKey: '' },
+  siliconflow: { baseUrl: 'https://api.siliconflow.cn/v1', model: 'deepseek-ai/DeepSeek-OCR', apiKey: '' }
+} as const
+
+/** 一键填充本地 Ollama 或硅基流动的接入参数。 */
+function applyDsPreset(name: keyof typeof DS_PRESETS): void {
+  const preset = DS_PRESETS[name]
+  dsBaseUrl.value = preset.baseUrl
+  dsModel.value = preset.model
+  if (name === 'ollama') dsApiKey.value = ''
+}
 const ocrPdfPath = ref('')
 const ocrDirectory = ref('')
 const ocrBusy = ref(false)
@@ -49,6 +67,28 @@ const ocrTotal = ref(0)
 const ocrResultPath = ref('')
 let ocrCancelled = false
 let ocrSessionId = ''
+
+/** DeepSeek 引擎时返回配置并顺手持久化；本地引擎返回 undefined。 */
+function deepseekConfig(): WechatDeepseekOcrConfig | undefined {
+  if (ocrEngine.value !== 'deepseek') return undefined
+  const config = { baseUrl: dsBaseUrl.value.trim(), apiKey: dsApiKey.value.trim(), model: dsModel.value.trim() }
+  localStorage.setItem(DS_STORAGE_KEY, JSON.stringify({ ...config, engine: ocrEngine.value }))
+  return config
+}
+
+function restoreDeepseekConfig(): void {
+  try {
+    const raw = localStorage.getItem(DS_STORAGE_KEY)
+    if (!raw) return
+    const saved = JSON.parse(raw) as Partial<WechatDeepseekOcrConfig & { engine: WechatOcrEngine }>
+    if (typeof saved.baseUrl === 'string' && saved.baseUrl) dsBaseUrl.value = saved.baseUrl
+    if (typeof saved.model === 'string' && saved.model) dsModel.value = saved.model
+    if (typeof saved.apiKey === 'string') dsApiKey.value = saved.apiKey
+    if (saved.engine === 'deepseek') ocrEngine.value = 'deepseek'
+  } catch {
+    // 忽略损坏的本地配置
+  }
+}
 
 async function pickMarkdown(): Promise<void> {
   const path = await window.electronApi.wechatExport.pickMarkdown()
@@ -126,7 +166,11 @@ async function runOcrDirectory(): Promise<void> {
   ocrCurrent.value = 0
   ocrTotal.value = 0
   try {
-    const result = await window.electronApi.wechatExport.ocrDirectoryStart({ directory: ocrDirectory.value })
+    const result = await window.electronApi.wechatExport.ocrDirectoryStart({
+      directory: ocrDirectory.value,
+      engine: ocrEngine.value,
+      deepseek: deepseekConfig()
+    })
     ocrSessionId = result.runId
     ocrTotal.value = result.fileCount
   } catch (error) {
@@ -146,7 +190,11 @@ async function runOcrPdf(): Promise<void> {
   ocrCurrent.value = 0
   ocrTotal.value = 0
   try {
-    const begin = await window.electronApi.wechatExport.ocrBegin(ocrPdfPath.value)
+    const begin = await window.electronApi.wechatExport.ocrBegin({
+      pdfPath: ocrPdfPath.value,
+      engine: ocrEngine.value,
+      deepseek: deepseekConfig()
+    })
     ocrSessionId = begin.sessionId
     const pdfjs = await import('pdfjs-dist')
     const workerUrl = (await import('pdfjs-dist/build/pdf.worker.min.mjs?url')).default
@@ -208,6 +256,7 @@ function reveal(path: string): void {
 }
 
 onMounted(() => {
+  restoreDeepseekConfig()
   unsubscribe = window.electronApi.wechatExport.onEvent((event: WechatExportEvent) => {
     if (event.task === 'pdf' && pdfBusy.value) pdfStatus.value = event.message
     if (event.task === 'slim' && slimBusy.value) slimStatus.value = event.message
@@ -285,6 +334,27 @@ function formatError(error: unknown): string {
         <NRadioButton value="pdf">PDF 文件</NRadioButton>
       </NRadioGroup>
       <p v-if="ocrMode === 'pdf'" class="modal-hint">注意：PDF 里的图片经过压缩再放大，识别精度低于直接使用截图目录（如 screenshots）。</p>
+      <div class="engine-block">
+        <span class="engine-label">识别引擎</span>
+        <NRadioGroup v-model:value="ocrEngine" size="small" :disabled="ocrBusy">
+          <NRadioButton value="windows">Windows 本地（免费离线）</NRadioButton>
+          <NRadioButton value="deepseek">DeepSeek-OCR（本地/云端）</NRadioButton>
+        </NRadioGroup>
+        <template v-if="ocrEngine === 'deepseek'">
+          <div class="preset-row">
+            <span class="engine-label">快速填充</span>
+            <NButton size="tiny" :disabled="ocrBusy" @click="applyDsPreset('ollama')">本地 Ollama</NButton>
+            <NButton size="tiny" :disabled="ocrBusy" @click="applyDsPreset('siliconflow')">硅基流动</NButton>
+          </div>
+          <label class="engine-field">接口地址<NInput v-model:value="dsBaseUrl" placeholder="http://127.0.0.1:11434/v1" :disabled="ocrBusy" /></label>
+          <label class="engine-field">模型名称<NInput v-model:value="dsModel" placeholder="deepseek-ocr" :disabled="ocrBusy" /></label>
+          <label class="engine-field">API Key<NInput v-model:value="dsApiKey" type="password" show-password-on="click" placeholder="本地 Ollama 留空；云端服务必填" :disabled="ocrBusy" /></label>
+          <p class="modal-hint">
+            本地部署：升级 Ollama 至 0.13+ 后执行 <code>ollama pull deepseek-ocr</code>（6.7GB），点上方"本地
+            Ollama"即可，无需联网调用；也兼容自建 vLLM 或硅基流动等云端 OpenAI 兼容接口（按量计费）。
+          </p>
+        </template>
+      </div>
       <button v-if="ocrMode === 'directory'" class="path-pick" :disabled="ocrBusy" :title="ocrDirectory" @click="pickOcrDirectory">
         <Images :size="16" />
         <span>{{ ocrDirectory || '选择截图目录（如输出目录下的 screenshots）...' }}</span>
@@ -348,4 +418,10 @@ function formatError(error: unknown): string {
 .export-modal .modal-actions { display: flex; align-items: center; gap: 10px; margin-top: 14px; }
 .export-modal .modal-status { margin: 10px 0 0; color: var(--text-muted); font-size: var(--ui-font-sm); word-break: break-all; }
 .export-modal .n-radio-group { margin: 2px 0 12px; }
+.export-modal .engine-block { display: flex; flex-direction: column; gap: 8px; padding: 10px 12px; margin-bottom: 12px; border: 1px solid var(--border-color); border-radius: 5px; }
+.export-modal .engine-block .n-radio-group { margin: 0; }
+.export-modal .engine-label { color: var(--text-muted); font-size: var(--ui-font-sm); font-weight: 700; }
+.export-modal .engine-field { display: flex; flex-direction: column; gap: 4px; color: var(--text-muted); font-size: var(--ui-font-sm); font-weight: 700; }
+.export-modal .preset-row { display: flex; align-items: center; gap: 8px; }
+.export-modal .modal-hint code { padding: 1px 5px; border-radius: 3px; background: var(--border-color); font-size: 0.92em; }
 </style>
