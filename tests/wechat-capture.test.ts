@@ -80,6 +80,19 @@ describe('微信长截图图像匹配', () => {
     expect(continuousFrameDecision(match, 24, 24)).toEqual({ kind: 'append', overlap: 19, shift: 5 })
   })
 
+  it('把 320px 缩略指纹中的重叠精确换算回原图坐标', () => {
+    const decision = continuousFrameDecision(
+      { overlap: 188, score: 0.004 },
+      1204,
+      320
+    )
+    expect(decision).toEqual({ kind: 'append', overlap: 707, shift: 497 })
+    expect(continuousOverlapSearchWindow(1204, 497, 100)).toEqual({
+      minimumRatio: (1204 - 497 - 100) / 1204,
+      maximumRatio: (1204 - 497 + 100) / 1204
+    })
+  })
+
   it('连续拼接从安全带提取半屏新内容', () => {
     expect(continuousSafeStripRegion(698, 354)).toEqual({ top: 134, height: 354, safeBottom: 488 })
     expect(() => continuousSafeStripRegion(698, 500)).toThrow('连续帧位移超出安全条带范围')

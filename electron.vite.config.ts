@@ -29,6 +29,14 @@ export default defineConfig({
         '@shared': resolve('src/shared')
       }
     },
-    plugins: [vue()]
+    plugins: [vue()],
+    build: {
+      rollupOptions: {
+        input: {
+          index: resolve('src/renderer/index.html'),
+          capture: resolve('src/renderer/capture.html')
+        }
+      }
+    }
   }
 })

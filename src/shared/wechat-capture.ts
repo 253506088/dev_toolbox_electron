@@ -1,10 +1,17 @@
-/** 可供微信截图工具选择的桌面窗口。 */
+/** 可供滚动截图工具选择的桌面窗口。 */
 export interface WechatWindowSource {
+  /** 用于检测 Electron 主进程是否仍是旧版本。 */
+  captureApiVersion: number
   id: string
   name: string
   thumbnailDataUrl: string
   width: number
   height: number
+  /** false 通常表示窗口已最小化，仍列出但需要恢复后刷新预览。 */
+  capturable: boolean
+  /** 已识别应用；unknown 表示自定义窗口。 */
+  application: 'wechat' | 'qq' | 'browser' | 'office' | 'ide' | 'terminal' | 'codex' | 'feishu' | 'dingtalk' | 'unknown'
+  applicationLabel: string
 }
 
 /** 以窗口尺寸百分比表示的截图区域。 */
@@ -15,7 +22,7 @@ export interface WechatCaptureCrop {
   bottom: number
 }
 
-/** 启动一次微信聊天记录抓取所需的参数。 */
+/** 启动一次滚动窗口抓取所需的参数。 */
 export interface WechatCaptureRequest {
   sourceId: string
   sourceName: string
@@ -37,6 +44,8 @@ export interface WechatContinuousCaptureRequest {
   frameIntervalMs: number
   scrollIntervalMs: number
   maxFrames: number
+  /** 窗口枚举时得到的预览尺寸，用于拦截低分辨率视频流。 */
+  expectedSize?: { width: number; height: number }
   /** 为 false 时不回顶，从当前位置向下截到底部；缺省按 true 处理。 */
   startFromTop?: boolean
 }

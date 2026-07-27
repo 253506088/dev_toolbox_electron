@@ -10,6 +10,7 @@ import type { BatchTaskEvent } from '../shared/batch-task'
 import type { MediaJobEvent } from '../shared/media-api'
 import type { WechatCaptureEvent } from '../shared/wechat-capture'
 import type { WechatExportEvent } from '../shared/wechat-export'
+import type { CaptureFrameSourceBridge, CaptureFrameSourceCommand, CaptureFrameSourceResult } from '../shared/capture-frame-source'
 
 /** 订阅一个白名单 IPC 事件，并返回取消订阅函数。 */
 function subscribe<T>(channel: string, callback: (payload: T) => void): () => void {
@@ -107,3 +108,9 @@ const api: ElectronApi = {
 }
 
 contextBridge.exposeInMainWorld('electronApi', api)
+
+const captureFrameSource: CaptureFrameSourceBridge = {
+  onCommand: (callback) => subscribe<CaptureFrameSourceCommand>('capture-frame-source:command', callback),
+  reply: (result: CaptureFrameSourceResult) => ipcRenderer.send('capture-frame-source:result', result)
+}
+contextBridge.exposeInMainWorld('captureFrameSource', captureFrameSource)

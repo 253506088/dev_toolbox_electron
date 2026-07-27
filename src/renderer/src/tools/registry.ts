@@ -37,7 +37,7 @@ export interface ToolRegistration {
 export const tools: ToolRegistration[] = [
   {
     id: 'wechat-capture',
-    name: '微信长截图',
+    name: '滚动长截图',
     group: '日常工具',
     icon: Camera,
     component: defineAsyncComponent(() => import('./WechatCaptureTool.vue'))

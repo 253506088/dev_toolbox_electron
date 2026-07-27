@@ -3,7 +3,7 @@ import type { WechatCaptureRequest, WechatContinuousCaptureRequest } from '../..
 import { WechatContinuousCaptureService } from '../services/wechat-continuous-capture-service'
 import { WechatCaptureService } from '../services/wechat-capture-service'
 
-/** 注册微信窗口枚举、输出目录和自动截图接口。 */
+/** 注册桌面窗口枚举、输出目录和自动滚动截图接口。 */
 export function registerWechatCaptureIpc(service: WechatCaptureService, continuous: WechatContinuousCaptureService): void {
   ipcMain.handle('wechat-capture:list-windows', () => service.listWindows())
   ipcMain.handle('wechat-capture:default-output-directory', () => service.defaultOutputDirectory)

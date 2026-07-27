@@ -34,8 +34,8 @@ const startFromTop = ref(true)
 const scrollStep = ref(2)
 const settleDelayMs = ref(350)
 const maxScreens = ref(300)
-const frameIntervalMs = ref(100)
-const scrollIntervalMs = ref(200)
+const frameIntervalMs = ref(120)
+const scrollIntervalMs = ref(240)
 const maxFrames = ref(5000)
 let unsubscribe: (() => void) | undefined
 
@@ -44,7 +44,10 @@ const previewAreaSize = reactive({ width: 0, height: 0 })
 let previewAreaObserver: ResizeObserver | undefined
 
 const selectedWindow = computed(() => windows.value.find((item) => item.id === selectedId.value) ?? null)
-const windowOptions = computed(() => windows.value.map((item) => ({ label: item.name, value: item.id })))
+const windowOptions = computed(() => windows.value.map((item) => ({
+  label: `[${item.applicationLabel || '其他'}] ${item.name}${isWindowCapturable(item) ? '' : '（需恢复窗口后刷新）'}`,
+  value: item.id
+})))
 const isFinished = computed(() => progress.value?.stage === 'complete' || progress.value?.stage === 'stopped')
 
 /** 按可用区域和窗口宽高比取“contain”最大尺寸，让预览铺满工作区。 */
@@ -56,11 +59,21 @@ const previewFitStyle = computed(() => {
   return { width: `${Math.max(40, Math.floor(width))}px` }
 })
 
-/** 刷新桌面窗口并优先选中第一个微信窗口。 */
+/** 刷新全部可截图桌面窗口；服务端已按常用应用和面积排序。 */
 async function refreshWindows(): Promise<void> {
   loadingWindows.value = true
   try {
-    windows.value = await window.electronApi.wechatCapture.listWindows()
+    const listedWindows = await window.electronApi.wechatCapture.listWindows()
+    if (listedWindows.length > 0 && listedWindows.every((item) => item.captureApiVersion !== 2)) {
+      message.warning('Electron 主进程仍是旧版本，请完整退出并重新启动应用')
+    }
+    windows.value = listedWindows.map((item) => ({
+      ...item,
+      captureApiVersion: item.captureApiVersion ?? 1,
+      application: item.application || 'unknown',
+      applicationLabel: item.applicationLabel || '其他',
+      capturable: item.capturable ?? Boolean(item.thumbnailDataUrl && item.width > 0 && item.height > 0)
+    }))
     if (!windows.value.some((item) => item.id === selectedId.value)) selectedId.value = windows.value[0]?.id ?? null
     if (windows.value.length === 0) message.warning('没有找到可抓取的桌面窗口')
   } catch (error) {
@@ -78,7 +91,7 @@ async function chooseOutputDirectory(): Promise<void> {
 
 /** 用当前窗口、截图区域和滚动参数启动任务。 */
 async function startCapture(): Promise<void> {
-  if (!selectedWindow.value || running.value) return
+  if (!selectedWindow.value || !isWindowCapturable(selectedWindow.value) || running.value) return
   running.value = true
   progress.value = { runId: '', stage: 'positioning', message: '正在启动...', screenCount: 0 }
   try {
@@ -94,7 +107,8 @@ async function startCapture(): Promise<void> {
           ...common,
           frameIntervalMs: frameIntervalMs.value,
           scrollIntervalMs: scrollIntervalMs.value,
-          maxFrames: maxFrames.value
+          maxFrames: maxFrames.value,
+          expectedSize: { width: selectedWindow.value.width, height: selectedWindow.value.height }
         })
       : await window.electronApi.wechatCapture.start({
           ...common,
@@ -124,12 +138,28 @@ function openOutput(): void {
 }
 
 function resetCrop(): void {
-  applyCrop({ left: 31, top: 9, right: 2, bottom: 25 })
+  applyCrop(profileCrop(selectedWindow.value?.application))
 }
 
 /** 预览与放大弹窗共用的选区更新入口，保持与右侧滑块双向同步。 */
 function applyCrop(value: WechatCaptureCrop): void {
   Object.assign(crop, value)
+}
+
+watch(selectedId, () => {
+  if (!running.value) applyCrop(profileCrop(selectedWindow.value?.application))
+})
+
+function profileCrop(application?: WechatWindowSource['application']): WechatCaptureCrop {
+  if (application === 'wechat') return { left: 31, top: 9, right: 2, bottom: 25 }
+  if (application === 'qq') return { left: 28, top: 9, right: 2, bottom: 22 }
+  if (application === 'browser') return { left: 0, top: 8, right: 0, bottom: 0 }
+  if (application === 'feishu' || application === 'dingtalk') return { left: 28, top: 8, right: 2, bottom: 18 }
+  return { left: 0, top: 0, right: 0, bottom: 0 }
+}
+
+function isWindowCapturable(source: WechatWindowSource): boolean {
+  return source.capturable !== false && source.width > 0 && source.height > 0 && Boolean(source.thumbnailDataUrl)
 }
 
 onMounted(async () => {
@@ -150,7 +180,7 @@ onMounted(async () => {
   unsubscribe = window.electronApi.wechatCapture.onEvent((event) => {
     progress.value = event
     running.value = !['complete', 'stopped', 'error'].includes(event.stage)
-    if (event.stage === 'complete') message.success('微信聊天记录截图已完成')
+    if (event.stage === 'complete') message.success('滚动长截图已完成')
     if (event.stage === 'stopped') message.info('截图已停止，已有内容已保存')
     if (event.stage === 'error') message.error(event.message)
   })
@@ -169,7 +199,7 @@ function formatError(error: unknown): string {
 </script>
 
 <template>
-  <ToolPage title="微信聊天长截图">
+  <ToolPage title="滚动长截图">
     <template #actions>
       <NRadioGroup v-model:value="captureMode" size="small" :disabled="running">
         <NRadioButton value="paged">逐屏截图</NRadioButton>
@@ -179,7 +209,7 @@ function formatError(error: unknown): string {
         <template #icon><NIcon :component="RefreshCw" /></template>
         刷新窗口
       </NButton>
-      <NButton v-if="!running" type="primary" :disabled="!selectedWindow" @click="startCapture">
+      <NButton v-if="!running" type="primary" :disabled="!selectedWindow || !isWindowCapturable(selectedWindow)" @click="startCapture">
         <template #icon><NIcon :component="Camera" /></template>
         开始截图
       </NButton>
@@ -196,9 +226,9 @@ function formatError(error: unknown): string {
             v-model:value="selectedId"
             :options="windowOptions"
             :disabled="running"
-            placeholder="选择微信窗口"
+            placeholder="选择目标窗口"
           />
-          <NButton :disabled="!selectedWindow" @click="zoomVisible = true">
+          <NButton :disabled="!selectedWindow || !isWindowCapturable(selectedWindow)" @click="zoomVisible = true">
             <template #icon><NIcon :component="Maximize2" /></template>
             放大调整
           </NButton>
@@ -206,7 +236,7 @@ function formatError(error: unknown): string {
           <NTag v-else-if="isFinished" type="success" :bordered="false">已保存</NTag>
         </div>
 
-        <div v-if="selectedWindow" ref="previewArea" class="preview-area">
+        <div v-if="selectedWindow && isWindowCapturable(selectedWindow)" ref="previewArea" class="preview-area">
           <CropSelector
             class="window-preview"
             :style="previewFitStyle"
@@ -219,7 +249,8 @@ function formatError(error: unknown): string {
             @update:crop="applyCrop"
           />
         </div>
-        <div v-else class="empty-preview">请打开微信聊天窗口后刷新</div>
+        <div v-else-if="selectedWindow" class="empty-preview">该窗口可能已最小化，请恢复窗口后刷新列表</div>
+        <div v-else class="empty-preview">请打开目标窗口后刷新</div>
 
         <section class="capture-status" :class="{ visible: progress }" aria-live="polite">
           <div>
@@ -257,12 +288,12 @@ function formatError(error: unknown): string {
 
         <div class="control-divider" />
         <h2>{{ captureMode === 'continuous' ? '连续采集参数' : '抓取参数' }}</h2>
-        <NCheckbox v-model:checked="startFromTop" :disabled="running">先回到聊天顶部再开始</NCheckbox>
+        <NCheckbox v-model:checked="startFromTop" :disabled="running">先回到内容顶部再开始</NCheckbox>
         <p class="option-hint">取消勾选则从当前位置向下截到底部</p>
         <template v-if="captureMode === 'continuous'">
           <div class="number-grid">
-            <label>采样间隔<NInputNumber v-model:value="frameIntervalMs" :min="80" :max="1000" :step="20" :disabled="running" /></label>
-            <label>滚动间隔<NInputNumber v-model:value="scrollIntervalMs" :min="160" :max="2000" :step="20" :disabled="running" /></label>
+            <label>稳定判定窗口<NInputNumber v-model:value="frameIntervalMs" :min="60" :max="500" :step="20" :disabled="running" /></label>
+            <label>滚动节流间隔<NInputNumber v-model:value="scrollIntervalMs" :min="120" :max="2000" :step="20" :disabled="running" /></label>
           </div>
           <label>最多采样帧数<NInputNumber v-model:value="maxFrames" :min="20" :max="20000" :step="100" :disabled="running" /></label>
         </template>

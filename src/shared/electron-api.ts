@@ -181,7 +181,7 @@ export interface ElectronApi {
     openImage(): Promise<{ name: string; dataUrl: string } | null>
   }
   wechatCapture: {
-    /** 列出当前可抓取的微信窗口。 */
+    /** 列出当前全部可抓取窗口。 */
     listWindows(): Promise<WechatWindowSource[]>
     /** 返回桌面上的默认输出目录。 */
     defaultOutputDirectory(): Promise<string>

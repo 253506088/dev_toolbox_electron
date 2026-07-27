@@ -5,6 +5,13 @@ import type { WechatCaptureCrop } from '../../shared/wechat-capture'
 /** 判定“画面已停稳”的指纹差异阈值，与顶部判定共用。 */
 export const FRAME_STILL_THRESHOLD = 0.0035
 
+export interface ScrollDriver {
+  readonly name: string
+  scroll(notches: number): Promise<void>
+  isMinimized(): Promise<boolean>
+  stop(): Promise<void>
+}
+
 export function parseWindowHandle(sourceId: string): string | null {
   return /^window:(\d+):/.exec(sourceId)?.[1] ?? null
 }
@@ -13,15 +20,16 @@ export function parseWindowHandle(sourceId: string): string | null {
  * 常驻 PowerShell 滚动进程：启动时编译一次 Win32 调用，此后通过
  * `scroll <格数>` 命令握手滚动（正数向上、负数向下），避免逐次 spawn 的开销。
  */
-export class WechatScrollController {
-  private readonly pending: Array<{ resolve: () => void; reject: (error: Error) => void }> = []
+export class WechatScrollController implements ScrollDriver {
+  readonly name = 'foreground-wheel'
+  private readonly pending: Array<{ resolve: (response: string) => void; reject: (error: Error) => void }> = []
   private outputBuffer = ''
   private errorText = ''
   private failure: Error | null = null
 
   static start(sourceId: string, crop: WechatCaptureCrop): WechatScrollController {
     const hwnd = parseWindowHandle(sourceId)
-    if (!hwnd) throw new Error('无法识别微信窗口句柄')
+    if (!hwnd) throw new Error('无法识别目标窗口句柄')
     const script = persistentScrollScript(hwnd, crop)
     const encoded = Buffer.from(script, 'utf16le').toString('base64')
     const child = spawn(
@@ -52,13 +60,24 @@ export class WechatScrollController {
 
   /** 滚动指定格数（1 格 = 120 wheel delta），正数向上、负数向下；等待进程回执后返回。 */
   scroll(notches: number): Promise<void> {
+    const amount = Math.trunc(notches)
+    return this.command(`scroll ${amount}`).then((response) => {
+      if (response === 'minimized') throw new TargetWindowMinimizedError()
+      if (response !== 'ok') throw new Error(`滚动控制器返回了未知状态：${response}`)
+    })
+  }
+
+  async isMinimized(): Promise<boolean> {
+    return await this.command('status') === 'minimized'
+  }
+
+  private command(command: string): Promise<string> {
     if (this.failure) return Promise.reject(this.failure)
     if (this.child.exitCode !== null || this.child.killed) return Promise.reject(new Error('滚动控制进程未运行'))
-    const amount = Math.trunc(notches)
-    return new Promise<void>((resolve, reject) => {
+    return new Promise<string>((resolve, reject) => {
       const item = { resolve, reject }
       this.pending.push(item)
-      this.child.stdin.write(`scroll ${amount}\n`, (error) => {
+      this.child.stdin.write(`${command}\n`, (error) => {
         if (!error) return
         const index = this.pending.indexOf(item)
         if (index >= 0) this.pending.splice(index, 1)
@@ -82,8 +101,9 @@ export class WechatScrollController {
     const lines = this.outputBuffer.split(/\r?\n/)
     this.outputBuffer = lines.pop() ?? ''
     for (const line of lines) {
-      if (line.trim() !== 'ok') continue
-      this.pending.shift()?.resolve()
+      const response = line.trim()
+      if (!['ok', 'ready', 'minimized'].includes(response)) continue
+      this.pending.shift()?.resolve(response)
     }
   }
 
@@ -131,7 +151,7 @@ export async function waitForStillFrame<T extends { fingerprint: Uint8Array }>(
 }
 
 export interface ScrollToTopOptions<T> {
-  controller: WechatScrollController
+  controller: Pick<ScrollDriver, 'scroll'>
   capture: () => Promise<T>
   isCancelled: () => boolean
   onProgress?: (burst: number) => void
@@ -140,10 +160,12 @@ export interface ScrollToTopOptions<T> {
   maxBursts?: number
   pollDelayMs?: number
   settleTimeoutMs?: number
+  /** 视频流路径可提供基于合成器重绘信号的低成本判稳。 */
+  settle?: () => Promise<StillFrameResult<T>>
 }
 
 /**
- * 快速定位聊天顶部：大突发向上滚动，短轮询判稳后与上一稳定帧对比；
+ * 快速定位内容顶部：大突发向上滚动，短轮询判稳后与上一稳定帧对比；
  * 连续多轮画面不再变化即认定到顶。用户取消时返回 null。
  */
 export async function scrollChatToTop<T extends { fingerprint: Uint8Array }>(
@@ -166,10 +188,9 @@ export async function scrollChatToTop<T extends { fingerprint: Uint8Array }>(
       if (options.isCancelled()) return null
       throw error
     }
-    const settled = await waitForStillFrame(options.capture, options.isCancelled, {
-      pollDelayMs,
-      timeoutMs: settleTimeoutMs
-    })
+    const settled = options.settle
+      ? await options.settle()
+      : await waitForStillFrame(options.capture, options.isCancelled, { pollDelayMs, timeoutMs: settleTimeoutMs })
     if (options.isCancelled()) return null
     const unchanged =
       settled.still &&
@@ -178,7 +199,7 @@ export async function scrollChatToTop<T extends { fingerprint: Uint8Array }>(
     reference = settled.frame
   }
   if (options.isCancelled()) return null
-  if (confirmations < confirmRounds) throw new Error('未能确认聊天记录顶部，请检查截图区域是否覆盖聊天消息列表')
+  if (confirmations < confirmRounds) throw new Error('未能确认内容顶部，请检查截图区域是否覆盖可滚动内容')
   return reference
 }
 
@@ -193,21 +214,27 @@ public static class WechatScrollNative {
   [StructLayout(LayoutKind.Sequential)] public struct RECT { public int Left; public int Top; public int Right; public int Bottom; }
   [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr hWnd, out RECT rect);
   [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr hWnd);
-  [DllImport("user32.dll")] public static extern bool ShowWindowAsync(IntPtr hWnd, int command);
   [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
   [DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y);
   [DllImport("user32.dll")] public static extern void mouse_event(uint flags, uint dx, uint dy, int data, UIntPtr extraInfo);
 }
 '@
 $handle = [IntPtr]::new([Int64]${hwnd})
-if ([WechatScrollNative]::IsIconic($handle)) { [WechatScrollNative]::ShowWindowAsync($handle, 9) | Out-Null }
-[WechatScrollNative]::SetForegroundWindow($handle) | Out-Null
-Start-Sleep -Milliseconds 80
 while ($true) {
   $command = [Console]::In.ReadLine()
   if ($null -eq $command -or $command -eq 'quit') { break }
   $parts = $command.Trim().Split(' ')
+  if ($parts[0] -eq 'status') {
+    if ([WechatScrollNative]::IsIconic($handle)) { [Console]::Out.WriteLine('minimized') } else { [Console]::Out.WriteLine('ready') }
+    [Console]::Out.Flush()
+    continue
+  }
   if ($parts[0] -ne 'scroll' -or $parts.Length -lt 2) { continue }
+  if ([WechatScrollNative]::IsIconic($handle)) {
+    [Console]::Out.WriteLine('minimized')
+    [Console]::Out.Flush()
+    continue
+  }
   $notches = 0
   if (-not [int]::TryParse($parts[1], [ref]$notches)) { continue }
   $rect = New-Object WechatScrollNative+RECT
@@ -228,6 +255,13 @@ while ($true) {
   [Console]::Out.Flush()
 }
 `
+}
+
+export class TargetWindowMinimizedError extends Error {
+  constructor() {
+    super('目标窗口已最小化')
+    this.name = 'TargetWindowMinimizedError'
+  }
 }
 
 function delay(milliseconds: number): Promise<void> {
