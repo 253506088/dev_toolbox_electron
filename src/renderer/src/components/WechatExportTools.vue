@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { onMounted, onUnmounted, ref } from 'vue'
-import { FileOutput, FileText, Images, ScanText } from '@lucide/vue'
+import { FileOutput, FileText, GalleryVertical, Images, ScanText } from '@lucide/vue'
 import {
   NButton,
   NCheckbox,
@@ -37,6 +37,14 @@ const slimQuality = ref(80)
 const slimBusy = ref(false)
 const slimStatus = ref('')
 const slimResultPath = ref('')
+
+// —— 拼接长图 ——
+const stitchVisible = ref(false)
+const stitchDirectory = ref('')
+const stitchMaxHeight = ref(20000)
+const stitchBusy = ref(false)
+const stitchStatus = ref('')
+const stitchResultPath = ref('')
 
 // —— OCR 转文稿 ——
 const ocrVisible = ref(false)
@@ -100,6 +108,11 @@ async function pickSlimDirectory(): Promise<void> {
   if (path) slimDirectory.value = path
 }
 
+async function pickStitchDirectory(): Promise<void> {
+  const path = await window.electronApi.wechatExport.pickDirectory()
+  if (path) stitchDirectory.value = path
+}
+
 async function pickOcrPdf(): Promise<void> {
   const path = await window.electronApi.wechatExport.pickPdf()
   if (path) ocrPdfPath.value = path
@@ -153,6 +166,27 @@ async function runSlimImages(): Promise<void> {
     message.error(slimStatus.value)
   } finally {
     slimBusy.value = false
+  }
+}
+
+async function runStitchImages(): Promise<void> {
+  if (!stitchDirectory.value || stitchBusy.value) return
+  stitchBusy.value = true
+  stitchStatus.value = '正在处理...'
+  stitchResultPath.value = ''
+  try {
+    const result = await window.electronApi.wechatExport.stitchImages({
+      inputDirectory: stitchDirectory.value,
+      maxHeight: stitchMaxHeight.value
+    })
+    stitchResultPath.value = result.outputDirectory
+    stitchStatus.value = `完成：${result.fileCount} 张分屏 → ${result.imageCount} 张长图`
+    message.success('长图拼接完成')
+  } catch (error) {
+    stitchStatus.value = formatError(error)
+    message.error(stitchStatus.value)
+  } finally {
+    stitchBusy.value = false
   }
 }
 
@@ -260,6 +294,7 @@ onMounted(() => {
   unsubscribe = window.electronApi.wechatExport.onEvent((event: WechatExportEvent) => {
     if (event.task === 'pdf' && pdfBusy.value) pdfStatus.value = event.message
     if (event.task === 'slim' && slimBusy.value) slimStatus.value = event.message
+    if (event.task === 'stitch' && stitchBusy.value) stitchStatus.value = event.message
     if (event.task === 'ocr' && ocrBusy.value && ocrMode.value === 'directory') {
       ocrStatus.value = event.message
       if (event.current !== undefined) ocrCurrent.value = event.current
@@ -300,6 +335,10 @@ function formatError(error: unknown): string {
     <NButton :disabled="ocrBusy" @click="ocrVisible = true">
       <template #icon><NIcon :component="ScanText" /></template>
       OCR 转聊天文稿
+    </NButton>
+    <NButton :disabled="stitchBusy" @click="stitchVisible = true">
+      <template #icon><NIcon :component="GalleryVertical" /></template>
+      拼接长图
     </NButton>
     <NButton :disabled="slimBusy" @click="slimVisible = true">
       <template #icon><NIcon :component="Images" /></template>
@@ -380,6 +419,25 @@ function formatError(error: unknown): string {
         :height="6"
       />
       <p v-if="ocrStatus" class="modal-status">{{ ocrStatus }}</p>
+    </NModal>
+
+    <NModal v-model:show="stitchVisible" preset="card" title="拼接长图" class="export-modal">
+      <p class="modal-hint">
+        把目录里的分屏截图（如 screen_0001.png）按文件名顺序自上而下拼接：从序号最小的一张作为顶部依次向下排；
+        累计高度超过上限就另起一张长图。输出到同级“_拼接长图”目录。
+      </p>
+      <button class="path-pick" :disabled="stitchBusy" :title="stitchDirectory" @click="pickStitchDirectory">
+        <Images :size="16" />
+        <span>{{ stitchDirectory || '选择截图目录（如输出目录下的 screenshots）...' }}</span>
+      </button>
+      <div class="option-grid">
+        <label>单张长图高度上限（像素）<NInputNumber v-model:value="stitchMaxHeight" :min="2000" :max="200000" :step="1000" :disabled="stitchBusy" /></label>
+      </div>
+      <div class="modal-actions">
+        <NButton type="primary" :loading="stitchBusy" :disabled="!stitchDirectory" @click="runStitchImages">开始拼接</NButton>
+        <NButton v-if="stitchResultPath" @click="reveal(stitchResultPath)">查看目录</NButton>
+      </div>
+      <p v-if="stitchStatus" class="modal-status">{{ stitchStatus }}</p>
     </NModal>
 
     <NModal v-model:show="slimVisible" preset="card" title="图片瘦身" class="export-modal">

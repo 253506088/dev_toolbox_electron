@@ -3,7 +3,8 @@ import type {
   WechatMarkdownToPdfRequest,
   WechatOcrBeginRequest,
   WechatOcrDirectoryRequest,
-  WechatSlimImagesRequest
+  WechatSlimImagesRequest,
+  WechatStitchImagesRequest
 } from '../../shared/wechat-export'
 import type { WechatExportService } from '../services/wechat-export-service'
 
@@ -34,6 +35,9 @@ export function registerWechatExportIpc(service: WechatExportService): void {
   )
   ipcMain.handle('wechat-export:slim-images', (event, request: WechatSlimImagesRequest) =>
     service.slimImages(request, event.sender)
+  )
+  ipcMain.handle('wechat-export:stitch-images', (event, request: WechatStitchImagesRequest) =>
+    service.stitchImages(request, event.sender)
   )
   ipcMain.handle('wechat-export:ocr-begin', (event, request: WechatOcrBeginRequest) => service.ocrBegin(request, event.sender))
   ipcMain.handle('wechat-export:ocr-directory', (event, request: WechatOcrDirectoryRequest) =>

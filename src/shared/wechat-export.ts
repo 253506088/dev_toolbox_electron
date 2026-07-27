@@ -1,4 +1,4 @@
-/** 微信截图后处理（MD 转 PDF / PDF OCR / 图片瘦身）的共享类型。 */
+/** 微信截图后处理（MD 转 PDF / PDF OCR / 图片瘦身 / 拼接长图）的共享类型。 */
 
 /** MD 转 PDF 请求。 */
 export interface WechatMarkdownToPdfRequest {
@@ -30,6 +30,42 @@ export interface WechatSlimImagesResult {
   fileCount: number
   inputBytes: number
   outputBytes: number
+}
+
+/** 分屏拼接长图请求。 */
+export interface WechatStitchImagesRequest {
+  inputDirectory: string
+  /** 单张长图的高度上限（像素），超限则新开一张。 */
+  maxHeight: number
+}
+
+export interface WechatStitchImagesResult {
+  outputDirectory: string
+  /** 参与拼接的分屏数量。 */
+  fileCount: number
+  /** 生成的长图数量。 */
+  imageCount: number
+}
+
+/**
+ * 按高度上限把按序排列的分屏分组，每组纵向拼成一张长图。
+ * 只在整图边界断开，避免把消息从中间截断；单张就超限的图独占一组。
+ */
+export function planStitchGroups(heights: ArrayLike<number>, maxHeight: number): number[][] {
+  const groups: number[][] = []
+  let current: number[] = []
+  let currentHeight = 0
+  for (let index = 0; index < heights.length; index += 1) {
+    if (current.length > 0 && currentHeight + heights[index] > maxHeight) {
+      groups.push(current)
+      current = []
+      currentHeight = 0
+    }
+    current.push(index)
+    currentHeight += heights[index]
+  }
+  if (current.length > 0) groups.push(current)
+  return groups
 }
 
 /** OCR 引擎：本地 Windows OCR 或 DeepSeek-OCR（OpenAI 兼容 API）。 */
@@ -77,7 +113,7 @@ export interface WechatOcrDirectoryStartResult {
 
 /** 后处理任务进度事件。 */
 export interface WechatExportEvent {
-  task: 'pdf' | 'slim' | 'ocr'
+  task: 'pdf' | 'slim' | 'stitch' | 'ocr'
   stage: 'running' | 'complete' | 'stopped' | 'error'
   message: string
   current?: number

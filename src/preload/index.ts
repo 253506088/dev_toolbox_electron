@@ -66,6 +66,7 @@ const api: ElectronApi = {
     pickDirectory: () => ipcRenderer.invoke('wechat-export:pick-directory'),
     markdownToPdf: (request) => ipcRenderer.invoke('wechat-export:markdown-to-pdf', request),
     slimImages: (request) => ipcRenderer.invoke('wechat-export:slim-images', request),
+    stitchImages: (request) => ipcRenderer.invoke('wechat-export:stitch-images', request),
     ocrBegin: (request) => ipcRenderer.invoke('wechat-export:ocr-begin', request),
     ocrDirectoryStart: (request) => ipcRenderer.invoke('wechat-export:ocr-directory', request),
     ocrPage: (sessionId, pageIndex, png) => ipcRenderer.invoke('wechat-export:ocr-page', sessionId, pageIndex, png),

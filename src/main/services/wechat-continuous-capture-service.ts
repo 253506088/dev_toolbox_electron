@@ -15,8 +15,8 @@ import {
   type WechatCaptureStartResult
 } from '../../shared/wechat-capture'
 import { scrollChatToTop, waitForStillFrame, WechatScrollController, FRAME_STILL_THRESHOLD } from './wechat-scroll-controller'
+import { nativeCaptureSize } from './capture-resolution'
 
-const CAPTURE_SIZE = { width: 1920, height: 1080 }
 const LONG_IMAGE_HEIGHT = 20_000
 const STOP_HOTKEY = 'CommandOrControl+E'
 const INITIAL_PULSE_NOTCHES = 12
@@ -398,7 +398,7 @@ export class WechatContinuousCaptureService {
   }
 
   private async capture(request: WechatContinuousCaptureRequest): Promise<ContinuousFrame> {
-    const sources = await desktopCapturer.getSources({ types: ['window'], thumbnailSize: CAPTURE_SIZE })
+    const sources = await desktopCapturer.getSources({ types: ['window'], thumbnailSize: nativeCaptureSize() })
     const source = sources.find((candidate) => candidate.id === request.sourceId)
     if (!source || source.thumbnail.isEmpty()) throw new Error('微信窗口已关闭或无法读取')
     const image = sharp(source.thumbnail.toPNG())

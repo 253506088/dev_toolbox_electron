@@ -209,6 +209,8 @@ export interface ElectronApi {
     markdownToPdf(request: WechatMarkdownToPdfRequest): Promise<WechatMarkdownToPdfResult>
     /** 批量压缩指定目录的图片。 */
     slimImages(request: WechatSlimImagesRequest): Promise<WechatSlimImagesResult>
+    /** 把目录里的分屏截图按文件名顺序拼接成一张或多张长图。 */
+    stitchImages(request: WechatStitchImagesRequest): Promise<WechatStitchImagesResult>
     /** 开始 PDF OCR 会话，返回 PDF 字节供渲染层光栅化。 */
     ocrBegin(request: WechatOcrBeginRequest): Promise<WechatOcrBeginResult & { pdfData: Uint8Array }>
     /** 图片目录 OCR：主进程后台执行，进度与结果走事件。 */
@@ -259,5 +261,7 @@ import type {
   WechatOcrFinishResult,
   WechatOcrPageResult,
   WechatSlimImagesRequest,
-  WechatSlimImagesResult
+  WechatSlimImagesResult,
+  WechatStitchImagesRequest,
+  WechatStitchImagesResult
 } from './wechat-export'

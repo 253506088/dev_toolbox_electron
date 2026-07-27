@@ -15,8 +15,11 @@ import type {
   WechatOcrFinishResult,
   WechatOcrPageResult,
   WechatSlimImagesRequest,
-  WechatSlimImagesResult
+  WechatSlimImagesResult,
+  WechatStitchImagesRequest,
+  WechatStitchImagesResult
 } from '../../shared/wechat-export'
+import { planStitchGroups } from '../../shared/wechat-export'
 import { assembleTranscript, buildPageMessages, segmentChatPage, type ChatMessage, type OcrWord } from '../../shared/wechat-transcript'
 import { WechatOcrController } from './wechat-ocr-controller'
 import { DeepseekOcrClient, validateDeepseekConfig } from './wechat-dsocr-client'
@@ -40,7 +43,7 @@ interface OcrSession {
   blockerId: number | null
 }
 
-/** 微信截图后处理：MD 转 PDF、图片瘦身、PDF 版面分析 OCR。 */
+/** 微信截图后处理：MD 转 PDF、图片瘦身、分屏拼接长图、PDF 版面分析 OCR。 */
 export class WechatExportService {
   private readonly ocrSessions = new Map<string, OcrSession>()
 
@@ -162,6 +165,71 @@ export class WechatExportService {
       message: `压缩完成：${formatBytes(inputBytes)} → ${formatBytes(outputBytes)}`
     })
     return { outputDirectory, fileCount: files.length, inputBytes, outputBytes }
+  }
+
+  /** 把目录里按文件名排序的分屏截图纵向拼接成一张或多张长图，超过高度上限就另起一张。 */
+  async stitchImages(request: WechatStitchImagesRequest, sender: WebContents): Promise<WechatStitchImagesResult> {
+    validateStitchRequest(request)
+    const entries = await readdir(request.inputDirectory, { withFileTypes: true })
+    const files = entries
+      .filter((entry) => entry.isFile() && SLIM_EXTENSIONS.has(extname(entry.name).toLowerCase()))
+      .map((entry) => entry.name)
+      .sort()
+    if (files.length === 0) throw new Error('目录中没有可拼接的图片（支持 png/jpg/webp）')
+
+    // 以第一张图的宽度为基准，宽度不同的图等比缩放对齐
+    const widths: number[] = []
+    const heights: number[] = []
+    for (const name of files) {
+      const metadata = await sharp(join(request.inputDirectory, name)).metadata()
+      if (!metadata.width || !metadata.height) throw new Error(`无法读取图片尺寸：${name}`)
+      widths.push(metadata.width)
+      heights.push(metadata.height)
+    }
+    const width = widths[0]
+    const scaledHeights = heights.map((height, index) =>
+      widths[index] === width ? height : Math.max(1, Math.round((height * width) / widths[index]))
+    )
+
+    const groups = planStitchGroups(scaledHeights, request.maxHeight)
+    const outputDirectory = `${request.inputDirectory.replace(/[\\/]+$/, '')}_拼接长图`
+    await rm(outputDirectory, { recursive: true, force: true })
+    await mkdir(outputDirectory, { recursive: true })
+
+    let stitched = 0
+    for (let groupIndex = 0; groupIndex < groups.length; groupIndex += 1) {
+      const pieces: Array<{ input: string | Buffer; top: number; left: number }> = []
+      let top = 0
+      for (const fileIndex of groups[groupIndex]) {
+        const sourcePath = join(request.inputDirectory, files[fileIndex])
+        pieces.push({
+          input: widths[fileIndex] === width ? sourcePath : await sharp(sourcePath).resize({ width }).png().toBuffer(),
+          top,
+          left: 0
+        })
+        top += scaledHeights[fileIndex]
+        stitched += 1
+      }
+      this.emit(sender, {
+        task: 'stitch',
+        stage: 'running',
+        message: `正在拼接第 ${groupIndex + 1}/${groups.length} 张长图（${stitched}/${files.length}）...`,
+        current: stitched,
+        total: files.length
+      })
+      const outputPath = join(outputDirectory, `long_${String(groupIndex + 1).padStart(3, '0')}.png`)
+      await sharp({ create: { width, height: top, channels: 3, background: '#ffffff' } })
+        .composite(pieces)
+        .png()
+        .toFile(outputPath)
+    }
+    this.emit(sender, {
+      task: 'stitch',
+      stage: 'complete',
+      message: `拼接完成：${files.length} 张分屏 → ${groups.length} 张长图`,
+      resultPath: outputDirectory
+    })
+    return { outputDirectory, fileCount: files.length, imageCount: groups.length }
   }
 
   /** 开始一次 PDF OCR 会话，返回会话 ID 和 PDF 原始字节（供渲染层用 pdfjs 逐页光栅化）。 */
@@ -364,6 +432,11 @@ function validateSlimRequest(request: WechatSlimImagesRequest): void {
   if (request.format !== 'webp' && request.format !== 'jpeg') throw new Error('输出格式无效')
   if (!Number.isInteger(request.maxWidth) || request.maxWidth < 320 || request.maxWidth > 4000) throw new Error('最大宽度必须在 320 到 4000 之间')
   if (!Number.isInteger(request.quality) || request.quality < 30 || request.quality > 100) throw new Error('压缩质量必须在 30 到 100 之间')
+}
+
+function validateStitchRequest(request: WechatStitchImagesRequest): void {
+  if (typeof request.inputDirectory !== 'string' || !request.inputDirectory.trim()) throw new Error('请选择图片目录')
+  if (!Number.isInteger(request.maxHeight) || request.maxHeight < 2000 || request.maxHeight > 200000) throw new Error('长度上限必须在 2000 到 200000 之间')
 }
 
 function buildPdfHtml(body: string): string {
