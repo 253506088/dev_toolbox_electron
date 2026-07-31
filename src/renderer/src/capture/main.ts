@@ -12,8 +12,7 @@ async function execute(command: CaptureFrameSourceCommand): Promise<void> {
   try {
     switch (command.method) {
       case 'open':
-        await source.open(command.payload)
-        result = { id: command.id, ok: true }
+        result = { id: command.id, ok: true, value: await source.open(command.payload) }
         break
       case 'fingerprint':
         result = { id: command.id, ok: true, value: source.fingerprint() }

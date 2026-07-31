@@ -4,6 +4,7 @@ import type {
   CaptureFrameSourceCommand,
   CaptureFrameSourceFrame,
   CaptureFrameSourceOpenRequest,
+  CaptureFrameSourceOpenResult,
   CaptureFrameSourceResult,
   CaptureFrameSourceSettleResult
 } from '../../shared/capture-frame-source'
@@ -24,11 +25,12 @@ export class VideoFrameSourceService {
     ipcMain.on('capture-frame-source:result', this.handleResult)
   }
 
-  async open(request: CaptureFrameSourceOpenRequest): Promise<void> {
+  async open(request: CaptureFrameSourceOpenRequest): Promise<CaptureFrameSourceOpenResult> {
     await this.ensureWindow()
     try {
-      await this.command({ id: crypto.randomUUID(), method: 'open', payload: request })
+      const result = await this.command({ id: crypto.randomUUID(), method: 'open', payload: request })
       if (this.powerSaveBlockerId === null) this.powerSaveBlockerId = powerSaveBlocker.start('prevent-app-suspension')
+      return result as CaptureFrameSourceOpenResult
     } catch (error) {
       this.stopPowerSaveBlocker()
       throw error

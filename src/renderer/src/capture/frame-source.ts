@@ -1,6 +1,7 @@
 import type {
   CaptureFrameSourceFrame,
   CaptureFrameSourceOpenRequest,
+  CaptureFrameSourceOpenResult,
   CaptureFrameSourceSettleResult
 } from '@shared/capture-frame-source'
 
@@ -17,7 +18,7 @@ export class FrameSource {
   private frameId = 0
   private cachedFrameId = 0
 
-  async open(request: CaptureFrameSourceOpenRequest): Promise<void> {
+  async open(request: CaptureFrameSourceOpenRequest): Promise<CaptureFrameSourceOpenResult> {
     this.close()
     this.crop = request.crop
     this.fingerprintWidth = request.fingerprintWidth ?? DEFAULT_FINGERPRINT_WIDTH
@@ -35,15 +36,11 @@ export class FrameSource {
     this.video.srcObject = this.stream
     await this.video.play()
     await waitForVideoDimensions(this.video, 3000)
-    if (request.minimumSize && (
-      this.video.videoWidth < request.minimumSize.width ||
-      this.video.videoHeight < request.minimumSize.height
-    )) {
-      throw new Error(
-        `视频流分辨率 ${this.video.videoWidth}×${this.video.videoHeight} 低于预览 ` +
-        `${request.minimumSize.width}×${request.minimumSize.height}`
-      )
-    }
+    const meetsMinimumSize = !request.minimumSize || (
+      this.video.videoWidth >= request.minimumSize.width &&
+      this.video.videoHeight >= request.minimumSize.height
+    )
+    return { width: this.video.videoWidth, height: this.video.videoHeight, meetsMinimumSize }
   }
 
   fingerprint(): CaptureFrameSourceFrame {

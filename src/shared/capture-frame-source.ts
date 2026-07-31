@@ -9,6 +9,12 @@ export interface CaptureFrameSourceOpenRequest {
   fingerprintWidth?: number
 }
 
+export interface CaptureFrameSourceOpenResult {
+  width: number
+  height: number
+  meetsMinimumSize: boolean
+}
+
 export interface CaptureFrameSourceFrame {
   frameId: number
   width: number
@@ -32,7 +38,7 @@ export type CaptureFrameSourceCommand =
   | { id: string; method: 'close' }
 
 export type CaptureFrameSourceResult =
-  | { id: string; ok: true; value?: CaptureFrameSourceFrame | CaptureFrameSourceSettleResult | Uint8Array }
+  | { id: string; ok: true; value?: CaptureFrameSourceOpenResult | CaptureFrameSourceFrame | CaptureFrameSourceSettleResult | Uint8Array }
   | { id: string; ok: false; error: string }
 
 export interface CaptureFrameSourceBridge {

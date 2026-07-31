@@ -33,6 +33,7 @@ const MIN_PULSE_NOTCHES = 4
 const MAX_PULSE_NOTCHES = 90
 const TARGET_SHIFT_RATIO = 0.5
 const SETTLE_TIMEOUT_MS = 1600
+type FrameSourceMode = 'video-stream' | 'video-settle-only' | 'desktop-capturer'
 
 interface ContinuousFrame {
   buffer: Buffer | null
@@ -114,8 +115,9 @@ class StripWriteQueue {
 export class WechatContinuousCaptureService {
   private activeRun: ContinuousRun | null = null
   private readonly videoFrameSource = new VideoFrameSourceService()
-  private useVideoFrameSource = false
+  private frameSourceMode: FrameSourceMode = 'desktop-capturer'
   private frameSourceFallbackReason: string | null = null
+  private frameSourceNote: string | null = null
 
   get defaultOutputDirectory(): string {
     return join(app.getPath('desktop'), '滚动长截图')
@@ -166,6 +168,9 @@ export class WechatContinuousCaptureService {
   }
 
   private async execute(run: ContinuousRun, request: WechatContinuousCaptureRequest): Promise<void> {
+    this.frameSourceMode = 'desktop-capturer'
+    this.frameSourceFallbackReason = null
+    this.frameSourceNote = null
     const stripsDirectory = join(run.outputDirectory, 'strips')
     const longDirectory = join(run.outputDirectory, 'long')
     const screenshotsDirectory = join(run.outputDirectory, 'screenshots')
@@ -186,18 +191,34 @@ export class WechatContinuousCaptureService {
         mkdir(screenshotsDirectory, { recursive: true })
       ]))
       try {
-        await run.log.measure('frame_source.open', () => this.videoFrameSource.open({
+        const opened = await run.log.measure('frame_source.open', () => this.videoFrameSource.open({
           sourceId: request.sourceId,
           crop: request.crop,
           maxSize: nativeCaptureSize(),
           minimumSize: request.expectedSize,
           fingerprintWidth: 320
         }))
-        this.useVideoFrameSource = true
         this.frameSourceFallbackReason = null
+        if (request.expectedSize && opened.meetsMinimumSize) {
+          this.frameSourceMode = 'video-stream'
+          this.frameSourceNote = null
+        } else {
+          this.frameSourceMode = 'video-settle-only'
+          this.frameSourceNote =
+            `视频流 ${opened.width}×${opened.height} 仅用于判稳；` +
+            `输出继续使用原生分辨率 ${request.expectedSize?.width ?? '?'}×${request.expectedSize?.height ?? '?'}`
+          run.log.record('frame_source.settle_only', undefined, {
+            videoWidth: opened.width,
+            videoHeight: opened.height,
+            outputMinimumWidth: request.expectedSize?.width,
+            outputMinimumHeight: request.expectedSize?.height
+          })
+          this.emit(run, 'positioning', this.frameSourceNote, 0, 0)
+        }
       } catch (error) {
-        this.useVideoFrameSource = false
+        this.frameSourceMode = 'desktop-capturer'
         this.frameSourceFallbackReason = error instanceof Error ? error.message : String(error)
+        this.frameSourceNote = null
         await this.videoFrameSource.close()
         run.log.record('frame_source.fallback', undefined, { reason: this.frameSourceFallbackReason })
         this.emit(run, 'positioning', `视频流不可用，已降级为兼容模式（较慢）：${this.frameSourceFallbackReason}`, 0, 0)
@@ -228,7 +249,8 @@ export class WechatContinuousCaptureService {
         height: first.height,
         sourcePreviewWidth: request.expectedSize?.width,
         sourcePreviewHeight: request.expectedSize?.height,
-        frameSource: this.frameSourceFallbackReason ? 'desktop-capturer' : 'video-stream'
+        frameSource: this.frameSourceMode,
+        frameSourceNote: this.frameSourceNote
       })
 
       const firstRegion = continuousSafeStripRegion(first.height, 1)
@@ -453,8 +475,9 @@ export class WechatContinuousCaptureService {
         stopped,
         failure: failure?.message,
         pixelsPerNotch,
-        frameSource: this.frameSourceFallbackReason ? 'desktop-capturer' : 'video-stream',
+        frameSource: this.frameSourceMode,
         frameSourceFallbackReason: this.frameSourceFallbackReason,
+        frameSourceNote: this.frameSourceNote,
         scrollDriver: run.scroller?.name ?? 'foreground-wheel',
         frames: report
       }, null, 2), 'utf8'))
@@ -494,7 +517,7 @@ export class WechatContinuousCaptureService {
       }
     } finally {
       await run.log.measure('frame_source.close', () => this.videoFrameSource.close())
-      this.useVideoFrameSource = false
+      this.frameSourceMode = 'desktop-capturer'
       if (this.activeRun === run) this.activeRun = null
       globalShortcut.unregister(STOP_HOTKEY)
       await run.log.finish(finalStatus, {
@@ -530,7 +553,7 @@ export class WechatContinuousCaptureService {
     request: WechatContinuousCaptureRequest,
     timeoutMs: number
   ): Promise<{ frame: ContinuousFrame; still: boolean; samples: number; captureMs: number }> {
-    if (this.useVideoFrameSource) {
+    if (this.frameSourceMode !== 'desktop-capturer') {
       try {
         const settled = await this.measureActive(
           'frame_source.wait_for_settle',
@@ -550,7 +573,8 @@ export class WechatContinuousCaptureService {
         if (error instanceof CaptureCancelledError) throw error
         this.frameSourceFallbackReason = error instanceof Error ? error.message : String(error)
         this.activeRun?.log.record('frame_source.fallback', undefined, { reason: this.frameSourceFallbackReason, stage: 'settle' })
-        this.useVideoFrameSource = false
+        this.frameSourceMode = 'desktop-capturer'
+        this.frameSourceNote = null
         await this.videoFrameSource.close()
       }
     }
@@ -563,7 +587,7 @@ export class WechatContinuousCaptureService {
   }
 
   private async capture(request: WechatContinuousCaptureRequest): Promise<ContinuousFrame> {
-    if (this.useVideoFrameSource) {
+    if (this.frameSourceMode === 'video-stream') {
       try {
         const frame = await this.measureActive('frame.capture.video_fingerprint', () => this.videoFrameSource.fingerprint())
         return {
@@ -578,7 +602,8 @@ export class WechatContinuousCaptureService {
       } catch (error) {
         this.frameSourceFallbackReason = error instanceof Error ? error.message : String(error)
         this.activeRun?.log.record('frame_source.fallback', undefined, { reason: this.frameSourceFallbackReason, stage: 'fingerprint' })
-        this.useVideoFrameSource = false
+        this.frameSourceMode = 'desktop-capturer'
+        this.frameSourceNote = null
         await this.videoFrameSource.close()
       }
     }
