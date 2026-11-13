@@ -4,6 +4,7 @@ import { ArrowUp, Copy, File, Folder, HardDrive, RefreshCw, Search, SquareArrowO
 import { NButton, NIcon, NInput, NSpin, NTooltip, NVirtualList, useMessage } from 'naive-ui'
 import type { DirectoryBatchEvent, DriveInfo, FileEntry, FolderSizeEvent } from '@shared/electron-api'
 import type { TreemapNode } from '@shared/treemap'
+import { formatExactFileSize, formatFileSize } from '@shared/file-size-display'
 import ToolPage from '../components/ToolPage.vue'
 import TreemapCanvas from '../components/TreemapCanvas.vue'
 
@@ -21,8 +22,23 @@ let stopSize: (() => void) | undefined
 
 const breadcrumbs = computed(() => buildBreadcrumbs(currentPath.value))
 const treemapNodes = computed<TreemapNode[]>(() => entries.value
-  .filter((entry) => (entry.size ?? 0) > 0)
-  .map((entry) => ({ path: entry.path, name: entry.name, size: entry.size ?? 0, isDirectory: entry.isDirectory })))
+  .filter((entry) => Number.isFinite(entry.size) && (entry.size ?? 0) > 0)
+  .map((entry) => ({ path: entry.path, name: entry.name, size: entry.size ?? 0, isDirectory: entry.isDirectory, logicalSize: entry.logicalSize ?? undefined })))
+const totalSize = computed(() => treemapNodes.value.reduce((sum, node) => sum + node.size, 0))
+const pendingEntries = computed(() => entries.value.filter((entry) => entry.sizeState === 'pending').length)
+const incompleteEntries = computed(() => entries.value.filter((entry) => entry.sizeState === 'error' || entry.sizeState === 'partial').length)
+const sharedBytes = computed(() => entries.value.reduce((sum, entry) => {
+  if (entry.size === null || entry.logicalSize === null || entry.logicalSize === undefined) return sum
+  if (!Number.isFinite(entry.size) || !Number.isFinite(entry.logicalSize)) return sum
+  return sum + Math.max(0, entry.logicalSize - entry.size)
+}, 0))
+const isCalculating = computed(() => loading.value || pendingEntries.value > 0)
+const treemapEmptyText = computed(() => {
+  if (isCalculating.value) return '正在统计文件夹大小…'
+  if (incompleteEntries.value) return '未能读取可展示的大小，请检查目录权限后刷新'
+  if (sharedBytes.value > 0) return '共享内容已在当前目录的其他项目中计入'
+  return entries.value.length ? '当前目录的项目大小均为 0 B' : '当前目录为空'
+})
 
 /** 页面挂载时订阅目录事件并读取磁盘。 */
 onMounted(async () => {
@@ -40,16 +56,20 @@ onBeforeUnmount(() => {
 
 /** 读取所有可用盘符和容量。 */
 async function loadDrives(): Promise<void> {
+  const previousRequestId = activeRequestId.value
+  activeRequestId.value = ''
   loading.value = true
   currentPath.value = ''
   address.value = ''
   entries.value = []
   try {
-    drives.value = await window.electronApi.files.listDrives()
+    if (previousRequestId) await window.electronApi.files.cancel(previousRequestId)
+    const result = await window.electronApi.files.listDrives()
+    if (!activeRequestId.value) drives.value = result
   } catch (error) {
-    message.error(`读取磁盘失败：${formatError(error)}`)
+    if (!activeRequestId.value) message.error(`读取磁盘失败：${formatError(error)}`)
   } finally {
-    loading.value = false
+    if (!activeRequestId.value) loading.value = false
   }
 }
 
@@ -57,7 +77,7 @@ async function loadDrives(): Promise<void> {
 async function navigate(path: string): Promise<void> {
   const target = path.trim()
   if (!target) return
-  if (activeRequestId.value) await window.electronApi.files.cancel(activeRequestId.value)
+  const previousRequestId = activeRequestId.value
   const requestId = crypto.randomUUID()
   activeRequestId.value = requestId
   currentPath.value = target
@@ -65,8 +85,11 @@ async function navigate(path: string): Promise<void> {
   entries.value = []
   loading.value = true
   try {
+    if (previousRequestId) await window.electronApi.files.cancel(previousRequestId)
+    if (activeRequestId.value !== requestId) return
     await window.electronApi.files.listDirectory(target, requestId)
   } catch (error) {
+    if (activeRequestId.value !== requestId) return
     loading.value = false
     message.error(`进入目录失败：${formatError(error)}`)
   }
@@ -86,7 +109,9 @@ function handleFolderSize(event: FolderSizeEvent): void {
   const entry = entries.value.find((item) => item.path === event.path)
   if (!entry) return
   entry.size = event.size
-  entry.sizeState = event.error ? 'error' : 'ready'
+  entry.logicalSize = event.logicalSize ?? event.size
+  entry.skippedEntries = event.skippedEntries
+  entry.sizeState = event.error && event.size === null ? 'error' : event.error || event.skippedEntries ? 'partial' : 'ready'
 }
 
 /** 点击列表或 Treemap 节点时仅进入文件夹，普通文件不执行。 */
@@ -98,6 +123,7 @@ function openEntry(entry: Pick<FileEntry, 'path' | 'isDirectory'>): void {
 function goParent(): void {
   if (!currentPath.value) return
   const trimmed = currentPath.value.replace(/[\\/]+$/, '')
+  if (/^[a-z]:$/i.test(trimmed)) { void loadDrives(); return }
   const index = Math.max(trimmed.lastIndexOf('\\'), trimmed.lastIndexOf('/'))
   const parent = index <= 2 ? `${trimmed.slice(0, 2)}\\` : trimmed.slice(0, index)
   void navigate(parent)
@@ -155,15 +181,18 @@ function buildBreadcrumbs(path: string): Array<{ label: string; path: string }> 
   return result
 }
 
-/** 把字节数格式化成紧凑容量。 */
-function formatBytes(bytes: number | null): string {
-  if (bytes === null) return '计算中...'
-  if (bytes < 1024) return `${bytes} B`
-  const units = ['KB', 'MB', 'GB', 'TB']
-  let value = bytes
-  let unit = -1
-  do { value /= 1024; unit += 1 } while (value >= 1024 && unit < units.length - 1)
-  return `${value.toFixed(value >= 10 ? 1 : 2)} ${units[unit]}`
+/** 去重归属为零不等于空目录，详情保留共享和未读取项目的解释。 */
+function entrySizeDetails(entry: FileEntry): string {
+  if (entry.sizeState === 'pending') return '正在统计文件夹大小'
+  if (entry.sizeState === 'error' || entry.size === null) return '无法读取大小，请检查访问权限'
+  if (entry.isSymbolicLink) return '符号链接或目录联接：不跟随目标统计，避免重复计算和循环'
+  const lines = [`当前视图计入 ${formatFileSize(entry.size)}（${formatExactFileSize(entry.size)}）`]
+  if (entry.logicalSize !== undefined && entry.logicalSize !== null && entry.logicalSize > entry.size) {
+    lines.push(`路径合计 ${formatFileSize(entry.logicalSize)}，共享硬链接 ${formatFileSize(entry.logicalSize - entry.size)}`)
+    if (entry.size === 0) lines.push('共享内容已在其他项计入；进入此目录会按新范围重新统计')
+  }
+  if (entry.sizeState === 'partial') lines.push(`${entry.skippedEntries ?? '部分'} 个项目未能读取，当前显示已读取部分`)
+  return lines.join('\n')
 }
 
 /** 计算磁盘已用容量。 */
@@ -186,14 +215,14 @@ function formatError(error: unknown): string {
       <NTooltip><template #trigger><NButton circle quaternary :disabled="!currentPath" @click="copyAddress"><template #icon><NIcon :component="Copy" /></template></NButton></template>复制完整路径</NTooltip>
       <NTooltip><template #trigger><NButton circle quaternary :disabled="!currentPath" @click="openInExplorer"><template #icon><NIcon :component="SquareArrowOutUpRight" /></template></NButton></template>在系统文件管理器中打开</NTooltip>
     </template>
-    <template #status><span class="status-text">{{ currentPath ? `${entries.length} 项` : `${drives.length} 个磁盘` }}</span></template>
+    <template #status><span class="status-text">{{ currentPath ? `${entries.length} 项 · ${isCalculating ? '大小统计中' : incompleteEntries ? '部分内容未能读取' : '大小统计完成'}` : `${drives.length} 个磁盘` }}</span></template>
 
     <NSpin :show="loading && !currentPath">
       <div v-if="!currentPath" class="drive-grid">
         <button v-for="drive in drives" :key="drive.path" class="drive-item" @click="navigate(drive.path)">
           <NIcon :component="HardDrive" :size="30" />
           <strong>{{ drive.path }}</strong>
-          <span>{{ formatBytes(usedBytes(drive)) }} / {{ formatBytes(drive.totalBytes) }}</span>
+          <span>{{ formatFileSize(usedBytes(drive)) }} / {{ formatFileSize(drive.totalBytes) }}</span>
           <div><i :style="{ width: `${Math.min(100, usedBytes(drive) / drive.totalBytes * 100)}%` }" /></div>
         </button>
       </div>
@@ -205,12 +234,17 @@ function formatError(error: unknown): string {
       </div>
       <div ref="splitHost" class="file-split" :style="{ gridTemplateColumns: `${splitPercent}% 7px minmax(0, 1fr)` }">
         <section class="file-list-panel">
-          <div class="file-list-header"><span>名称</span><span>大小</span><span>修改时间</span></div>
+          <div class="file-list-header"><span>名称</span><span title="同一个硬链接文件在当前目录视图中只计入一次">计入大小</span><span>修改时间</span></div>
           <NVirtualList :items="entries" :item-size="38" key-field="path" class="file-virtual-list">
             <template #default="{ item }">
-              <button class="file-row" @dblclick="openEntry(item)">
+              <button class="file-row" :title="item.path" @dblclick="openEntry(item)">
                 <span><NIcon :component="item.isDirectory ? Folder : File" />{{ item.name }}</span>
-                <span>{{ item.sizeState === 'error' ? '无法读取' : formatBytes(item.size) }}</span>
+                <span class="file-size-cell" :title="entrySizeDetails(item)">
+                  <span>{{ item.sizeState === 'error' ? '无法读取' : formatFileSize(item.size) }}</span>
+                  <small v-if="item.sizeState === 'partial'">部分读取</small>
+                  <small v-else-if="item.isSymbolicLink">链接未跟随</small>
+                  <small v-else-if="item.size === 0 && item.logicalSize > 0">共享内容已计入</small>
+                </span>
                 <span>{{ item.modifiedAt ? new Date(item.modifiedAt).toLocaleString() : '-' }}</span>
               </button>
             </template>
@@ -218,7 +252,24 @@ function formatError(error: unknown): string {
           <div v-if="loading" class="file-loading"><NSpin size="small" /> 正在分批读取...</div>
         </section>
         <div class="split-handle" @pointerdown="startResize" />
-        <section class="treemap-panel"><TreemapCanvas :nodes="treemapNodes" @open="openEntry" /></section>
+        <section class="treemap-panel">
+          <header class="size-summary" aria-live="polite">
+            <div>
+              <span class="size-summary-label">{{ isCalculating || incompleteEntries ? '已统计大小' : '总大小' }} · 硬链接去重</span>
+              <strong :title="formatExactFileSize(totalSize)">{{ formatFileSize(totalSize) }}</strong>
+              <span class="size-summary-exact">{{ formatExactFileSize(totalSize) }}</span>
+            </div>
+            <div class="size-scan-state">
+              <span v-if="loading">正在读取目录…</span>
+              <span v-else-if="pendingEntries">还有 {{ pendingEntries }} 项待统计</span>
+              <span v-else>{{ incompleteEntries ? '统计结束，部分内容无法读取' : '统计完成' }}</span>
+              <span v-if="incompleteEntries" class="size-partial">{{ incompleteEntries }} 项未完整读取</span>
+              <span v-if="sharedBytes > 0">已排除重复 {{ formatFileSize(sharedBytes) }}</span>
+            </div>
+          </header>
+          <div class="treemap-stage"><TreemapCanvas :nodes="treemapNodes" :empty-text="treemapEmptyText" @open="openEntry" /></div>
+          <p class="size-explanation">面积按已统计大小占比。硬链接在当前目录中仅计一次，进入子目录会重新统计；此处为文件内容大小，并非磁盘实际占用。</p>
+        </section>
       </div>
     </div>
   </ToolPage>
@@ -238,6 +289,16 @@ function formatError(error: unknown): string {
 .breadcrumbs button { flex: 0 0 auto; height: 28px; padding: 0 8px; color: var(--text-color); border: 1px solid var(--border-color); border-radius: 4px; background: var(--surface-muted); cursor: pointer; }
 .file-split { display: grid; flex: 1; min-height: 0; overflow: hidden; }
 .file-list-panel, .treemap-panel { position: relative; min-width: 0; min-height: 0; overflow: hidden; border: 1px solid var(--border-color); }
+.treemap-panel { display: flex; flex-direction: column; }
+.treemap-stage { flex: 1; min-height: 0; }
+.size-summary { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px 16px; padding: 12px 14px; border-bottom: 1px solid var(--border-color); background: var(--surface-color); }
+.size-summary > div { display: flex; flex-direction: column; min-width: 0; gap: 3px; }
+.size-summary-label, .size-summary-exact, .size-scan-state, .size-explanation { color: var(--text-muted); font-size: var(--ui-font-xs); }
+.size-summary strong { color: var(--text-color); font-size: var(--ui-font-xxl); line-height: 1.3; font-variant-numeric: tabular-nums; }
+.size-summary-exact { font-variant-numeric: tabular-nums; }
+.size-scan-state { line-height: 1.5; }
+.size-partial { color: var(--warning-color, #b45309); }
+.size-explanation { flex: 0 0 auto; margin: 0; padding: 8px 12px; border-top: 1px solid var(--border-color); background: var(--surface-muted); line-height: 1.65; }
 .file-list-header, .file-row { display: grid; grid-template-columns: minmax(140px, 1fr) 100px 154px; align-items: center; width: 100%; }
 .file-list-header { height: 34px; padding: 0 8px; color: var(--text-muted); background: var(--surface-muted); font-size: var(--ui-font-xs); font-weight: 700; }
 .file-virtual-list { height: calc(100% - 34px); }
@@ -245,6 +306,8 @@ function formatError(error: unknown): string {
 .file-row:hover { background: var(--active-background); }
 .file-row > span { overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
 .file-row > span:first-child { display: flex; align-items: center; gap: 6px; }
+.file-size-cell { display: flex; flex-direction: column; gap: 1px; font-variant-numeric: tabular-nums; }
+.file-size-cell small { overflow: hidden; color: var(--text-muted); font-size: 10px; white-space: nowrap; text-overflow: ellipsis; }
 .file-loading { position: absolute; right: 10px; bottom: 10px; display: flex; align-items: center; gap: 7px; padding: 6px 9px; border: 1px solid var(--border-color); border-radius: 4px; background: var(--surface-color); font-size: var(--ui-font-sm); }
 .split-handle { cursor: col-resize; background: var(--app-background); }
 .split-handle:hover { background: var(--accent-color); }

@@ -1,8 +1,9 @@
-import { readdir, stat, statfs } from 'node:fs/promises'
+import { lstat, readdir, stat, statfs } from 'node:fs/promises'
 import { shell, type WebContents } from 'electron'
 import { isAbsolute, join, normalize, win32 } from 'node:path'
 import type { DirectoryBatchEvent, DriveInfo, FileEntry, FolderSizeEvent } from '../../shared/electron-api'
 import { FolderSizePool } from './folder-size-pool'
+import { fileSizeResult, type FolderScanResult } from './folder-size-scanner'
 import { writeLog } from './logger'
 
 const BATCH_SIZE = 500
@@ -43,17 +44,25 @@ export class FileService {
       for (let offset = 0; offset < directoryEntries.length; offset += BATCH_SIZE) {
         if (this.cancelled.has(requestId) || sender.isDestroyed()) return
         const slice = directoryEntries.slice(offset, offset + BATCH_SIZE)
+        const hardlinkedFiles = new Map<string, FolderScanResult>()
         const entries = await Promise.all(slice.map(async (entry): Promise<FileEntry> => {
           const entryPath = join(safePath, entry.name)
           try {
-            const info = await stat(entryPath)
+            const info = await lstat(entryPath, { bigint: true })
+            const isLink = info.isSymbolicLink()
+            const isDirectory = info.isDirectory() && !isLink
+            const file = fileSizeResult(info)
+            const pending = isDirectory || file.hardlinks.length > 0
+            if (file.hardlinks.length) hardlinkedFiles.set(entryPath, file)
             return {
               name: entry.name,
               path: entryPath,
-              isDirectory: entry.isDirectory(),
-              size: entry.isDirectory() ? null : info.size,
+              isDirectory,
+              isSymbolicLink: isLink,
+              size: pending ? null : file.size,
+              logicalSize: isDirectory ? null : file.logicalSize,
               modifiedAt: info.mtime.toISOString(),
-              sizeState: entry.isDirectory() ? 'pending' : 'ready'
+              sizeState: pending ? 'pending' : 'ready'
             }
           } catch {
             return {
@@ -74,6 +83,12 @@ export class FileService {
               path: entry.path,
               onResult: (event) => this.sendFolderSize(sender, event)
             })
+          } else if (hardlinkedFiles.has(entry.path)) {
+            this.sizePool.enqueueFile({
+              requestId,
+              path: entry.path,
+              onResult: (event) => this.sendFolderSize(sender, event)
+            }, hardlinkedFiles.get(entry.path)!)
           }
         }
       }
@@ -88,6 +103,8 @@ export class FileService {
         error: error instanceof Error ? error.message : String(error)
       })
       await writeLog('文件管理器', `目录读取失败：${safePath}`, error)
+    } finally {
+      this.sizePool.finishRequest(requestId)
     }
   }
 

@@ -1,7 +1,7 @@
 <script setup lang="ts">
-import { ref } from 'vue'
-import { AlignLeft, Clipboard, Eraser, Minimize2 } from '@lucide/vue'
-import { NButton, NIcon, NSpin, useMessage } from 'naive-ui'
+import { ref, watch } from 'vue'
+import { AlignLeft, Clipboard, CodeXml, Eraser, Minimize2 } from '@lucide/vue'
+import { NButton, NIcon, useMessage } from 'naive-ui'
 import MonacoEditor from '../components/MonacoEditor.vue'
 import ToolPage from '../components/ToolPage.vue'
 import { copyText } from '../utils/clipboard'
@@ -11,13 +11,17 @@ import type { TextOperation } from '../utils/text-operations'
 const text = ref('')
 const message = useMessage()
 const { busy, error, run } = useOperationState()
+let inputVersion = 0
+watch(text, () => { inputVersion += 1 }, { flush: 'sync' })
 
 /**
  * 执行 SQL 格式化或压缩。
  */
 async function transform(operation: TextOperation): Promise<void> {
-  const result = await run(operation, text.value)
-  if (result !== undefined) text.value = result
+  const version = inputVersion
+  const isCurrent = (): boolean => version === inputVersion
+  const result = await run(operation, text.value, isCurrent)
+  if (result !== undefined && isCurrent()) text.value = result
 }
 
 /**
@@ -48,6 +52,14 @@ function clear(): void {
         <template #icon><NIcon :component="Minimize2" /></template>
         压缩
       </NButton>
+      <NButton :disabled="busy" @click="transform('xml-unescape')">
+        <template #icon><NIcon :component="CodeXml" /></template>
+        XML 解码
+      </NButton>
+      <NButton :disabled="busy" @click="transform('xml-escape')">
+        <template #icon><NIcon :component="CodeXml" /></template>
+        XML 编码
+      </NButton>
       <NButton :disabled="!text" @click="copy">
         <template #icon><NIcon :component="Clipboard" /></template>
         复制
@@ -57,9 +69,23 @@ function clear(): void {
         清空
       </NButton>
     </template>
-    <template #status><span v-if="error" class="error-text">{{ error }}</span></template>
-    <NSpin :show="busy" class="editor-spin">
-      <MonacoEditor v-model="text" language="sql" aria-label="SQL 编辑器" />
-    </NSpin>
+    <template #status><span class="status-text">{{ busy ? '正在后台格式化，可继续编辑' : '支持 MyBatis #{…}、${…} 和动态 XML' }}</span></template>
+    <div class="sql-workspace">
+      <div v-if="error" class="sql-error" role="alert">
+        <span>{{ error }}</span>
+        <NButton size="small" quaternary @click="error = ''">关闭</NButton>
+      </div>
+      <div class="sql-editor">
+        <MonacoEditor v-model="text" language="sql" aria-label="SQL 编辑器" />
+      </div>
+    </div>
   </ToolPage>
 </template>
+
+<style scoped>
+.sql-workspace { display: flex; flex-direction: column; height: 100%; min-height: 0; gap: 8px; }
+.sql-editor { display: flex; flex: 1; min-height: 0; }
+.sql-error { display: flex; flex: 0 0 auto; align-items: flex-start; gap: 10px; max-height: 96px; overflow: auto; padding: 8px 12px; color: var(--error-color); border: 1px solid var(--error-color); border-radius: 4px; font-size: var(--ui-font-sm); }
+.sql-error span { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+.sql-error :deep(.n-button) { flex: none; }
+</style>

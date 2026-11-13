@@ -4,6 +4,8 @@ export interface TreemapNode {
   name: string
   size: number
   isDirectory: boolean
+  /** 未去重的路径大小，用于说明硬链接共享的容量。 */
+  logicalSize?: number
 }
 
 /** Treemap 绘制矩形。 */
@@ -26,7 +28,8 @@ export function layoutTreemap(
   width: number,
   height: number
 ): TreemapRect[] {
-  const validNodes = nodes.filter((node) => node.size > 0).sort((a, b) => b.size - a.size)
+  if (!Number.isFinite(width) || !Number.isFinite(height)) return []
+  const validNodes = nodes.filter((node) => Number.isFinite(node.size) && node.size > 0).sort((a, b) => b.size - a.size)
   return splitNodes(validNodes, 0, 0, Math.max(0, width), Math.max(0, height))
 }
 

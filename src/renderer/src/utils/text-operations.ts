@@ -1,11 +1,13 @@
 import { XMLBuilder, XMLParser } from 'fast-xml-parser'
-import { format as formatSql } from 'sql-formatter'
+import { formatSqlTemplate } from './sql-format'
 
 export type TextOperation =
   | 'sql-format'
   | 'sql-compress'
   | 'sql-in-format'
   | 'sql-in-unformat'
+  | 'xml-escape'
+  | 'xml-unescape'
   | 'json-format'
   | 'json-compress'
   | 'json-escape'
@@ -32,6 +34,10 @@ export function executeTextOperation(operation: TextOperation, input: string): s
       return formatSqlIn(input)
     case 'sql-in-unformat':
       return unformatSqlIn(input)
+    case 'xml-escape':
+      return escapeXmlText(input)
+    case 'xml-unescape':
+      return unescapeXmlText(input)
     case 'json-format':
       return formatJson(input)
     case 'json-compress':
@@ -61,21 +67,34 @@ export function executeTextOperation(operation: TextOperation, input: string): s
 
 /**
  * 使用成熟格式化器整理 SQL，并统一为大写关键字和两个空格缩进。
- * 通过自定义参数类型识别 MyBatis 的 #{...} / ${...} 占位符，避免解析报错；
- * positional 显式保留 JDBC 风格的 ? 参数。
+ * 保护 MyBatis 占位符、动态标签、CDATA 与 SQL 字面量后再交给格式化器。
  */
 export function formatSqlText(input: string): string {
-  if (!input.trim()) return ''
-  return formatSql(input, {
-    language: 'sql',
-    keywordCase: 'upper',
-    tabWidth: 2,
-    linesBetweenQueries: 2,
-    paramTypes: {
-      positional: true,
-      custom: [{ regex: String.raw`[#$]\{[^{}]*\}` }]
-    }
-  })
+  return formatSqlTemplate(input)
+}
+
+/**
+ * 将 XML 保留字符转成实体，便于粘贴到 MyBatis XML 中。
+ */
+export function escapeXmlText(input: string): string {
+  return input
+    .replaceAll('&', '&amp;')
+    .replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;')
+    .replaceAll('"', '&quot;')
+    .replaceAll("'", '&apos;')
+}
+
+/**
+ * 还原常用 XML 实体。最后处理 &amp;，避免二次解码嵌套实体。
+ */
+export function unescapeXmlText(input: string): string {
+  return input
+    .replaceAll('&lt;', '<')
+    .replaceAll('&gt;', '>')
+    .replaceAll('&quot;', '"')
+    .replaceAll('&apos;', "'")
+    .replaceAll('&amp;', '&')
 }
 
 /**

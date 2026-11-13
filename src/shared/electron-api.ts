@@ -77,9 +77,14 @@ export interface FileEntry {
   name: string
   path: string
   isDirectory: boolean
+  /** 当前导航内按文件身份去重后归属给此项的内容字节数，并非磁盘分配空间。 */
   size: number | null
+  /** 按路径累加的逻辑大小，用于说明硬链接重复占用。 */
+  logicalSize?: number | null
+  skippedEntries?: number
+  isSymbolicLink?: boolean
   modifiedAt: string | null
-  sizeState: 'ready' | 'pending' | 'error'
+  sizeState: 'ready' | 'pending' | 'partial' | 'error'
 }
 
 /** 目录分批读取事件。 */
@@ -96,6 +101,8 @@ export interface FolderSizeEvent {
   requestId: string
   path: string
   size: number | null
+  logicalSize?: number | null
+  skippedEntries?: number
   error?: string
 }
 

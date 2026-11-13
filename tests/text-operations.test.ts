@@ -7,11 +7,13 @@ import {
   encodeBase64,
   encodeUnicode,
   escapeJsonText,
+  escapeXmlText,
   formatJson,
   formatSqlIn,
   formatSqlText,
   jsonToXml,
   unescapeJsonText,
+  unescapeXmlText,
   unformatSqlIn,
   xmlToJson
 } from '../src/renderer/src/utils/text-operations'
@@ -33,6 +35,20 @@ describe('文本转换核心', () => {
     expect(result).toContain('#{query.beginTime}')
     expect(result).toContain('= ?')
     expect(result).toContain('WHERE')
+  })
+
+  it('格式化 SQL 前还原 XML 转义符', () => {
+    const result = formatSqlText(
+      'select * from users <!-- MyBatis XML 注释 --> where status &lt;> 2 and score &gt;= 60'
+    )
+    expect(result).toContain('status <> 2')
+    expect(result).toContain('score >= 60')
+  })
+
+  it('XML 转义与去转义可往返', () => {
+    const source = `status <> 2 and title = "Tom & Jerry's"`
+    expect(escapeXmlText(source)).toBe('status &lt;&gt; 2 and title = &quot;Tom &amp; Jerry&apos;s&quot;')
+    expect(unescapeXmlText(escapeXmlText(source))).toBe(source)
   })
 
   it('把 SQL 压成单行', () => {
