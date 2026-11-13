@@ -7,10 +7,13 @@ import {
   classifyCaptureOverlap,
   findVerticalOverlap,
   normalizedImageDifference,
+  validateWechatVoiceOptions,
+  WECHAT_CAPTURE_API_VERSION,
   type WechatCaptureEvent,
   type WechatCaptureRequest,
   type WechatCaptureStartResult,
-  type WechatWindowSource
+  type WechatWindowSource,
+  type WechatVoiceConversionStats
 } from '../../shared/wechat-capture'
 import {
   scrollChatToTop,
@@ -20,6 +23,7 @@ import {
 } from './wechat-scroll-controller'
 import { nativeCaptureSize } from './capture-resolution'
 import { CaptureTimingLog } from './capture-timing-log'
+import { WechatVoicePreparation } from './wechat-voice-preparation'
 
 const FINGERPRINT_WIDTH = 320
 const LONG_IMAGE_HEIGHT = 20_000
@@ -32,6 +36,8 @@ interface ActiveRun {
   outputDirectory: string
   scroller: ScrollDriver | null
   log: CaptureTimingLog
+  voice?: WechatVoicePreparation<CapturedFrame>
+  voiceConversion?: WechatVoiceConversionStats
 }
 
 interface CapturedFrame {
@@ -40,6 +46,7 @@ interface CapturedFrame {
   height: number
   fingerprint: Uint8Array
   fingerprintHeight: number
+  fingerprintWidth: number
 }
 
 /** 抓取任意桌面窗口、自动滚动，并产出分屏、长图和 Markdown。 */
@@ -64,7 +71,7 @@ export class WechatCaptureService {
         const application = identifyApplication(source.name)
         const capturable = !source.thumbnail.isEmpty() && size.width > 0 && size.height > 0
         return {
-          captureApiVersion: 2,
+          captureApiVersion: WECHAT_CAPTURE_API_VERSION,
           id: source.id,
           name: source.name || '未命名窗口',
           thumbnailDataUrl: capturable ? source.thumbnail.toDataURL() : source.appIcon?.toDataURL() ?? '',
@@ -94,7 +101,8 @@ export class WechatCaptureService {
       crop: request.crop,
       scrollStep: request.scrollStep,
       settleDelayMs: request.settleDelayMs,
-      maxScreens: request.maxScreens
+      maxScreens: request.maxScreens,
+      convertVoiceToText: request.convertVoiceToText === true
     })
     const run: ActiveRun = { id: crypto.randomUUID(), cancelled: false, sender, outputDirectory, scroller: null, log }
     this.activeRun = run
@@ -109,7 +117,10 @@ export class WechatCaptureService {
 
   /** 请求停止当前抓取；当前一次截图或滚动结束后退出。 */
   stop(): void {
-    if (this.activeRun) this.activeRun.cancelled = true
+    if (!this.activeRun) return
+    const run = this.activeRun
+    run.cancelled = true
+    void run.voice?.stop().catch((error: unknown) => run.log.record('voice.stop_failed', undefined, { error: String(error) }))
   }
 
   dispose(): void {
@@ -130,6 +141,24 @@ export class WechatCaptureService {
       const scrollerStartedAt = performance.now()
       run.scroller = WechatScrollController.start(request.sourceId, request.crop)
       run.log.record('scroll_driver.start', performance.now() - scrollerStartedAt, { driver: run.scroller.name })
+      if (request.convertVoiceToText) {
+        run.voice = new WechatVoicePreparation({
+          sourceId: request.sourceId, crop: request.crop, outputDirectory: run.outputDirectory,
+          capture: () => this.capture(run, request),
+          scroll: (notches) => this.scroll(run, notches, 0),
+          isCancelled: () => run.cancelled || run.sender.isDestroyed(),
+          log: run.log,
+          onProgress: (message, stats) => {
+            run.voiceConversion = stats
+            this.emit(run, 'transcribing', message, 0)
+          }
+        })
+        if (!await run.voice.prepare() || run.cancelled || run.sender.isDestroyed()) {
+          finalStatus = 'stopped'
+          this.emit(run, 'stopped', '语音预处理已停止，尚未生成截图', 0)
+          return
+        }
+      }
       const startFromTop = request.startFromTop !== false
       this.emit(run, 'positioning', startFromTop ? '正在将内容滚动到顶部...' : '从当前位置开始截图...', 0)
       const top = await run.log.measure(startFromTop ? 'position_to_top.total' : 'capture_start_frame.total', () => startFromTop
@@ -246,10 +275,11 @@ export class WechatCaptureService {
         this.emit(run, 'error', message, screenPaths.length)
       }
     } finally {
+      await run.voice?.stop()
       await this.stopScroller(run)
       if (this.activeRun === run) this.activeRun = null
       globalShortcut.unregister(STOP_HOTKEY)
-      await run.log.finish(finalStatus, { screens: screenPaths.length, error: finalError })
+      await run.log.finish(finalStatus, { screens: screenPaths.length, voiceConversion: run.voiceConversion, error: finalError })
     }
   }
 
@@ -272,7 +302,8 @@ export class WechatCaptureService {
       width: region.width,
       height: region.height,
       fingerprint,
-      fingerprintHeight
+      fingerprintHeight,
+      fingerprintWidth: FINGERPRINT_WIDTH
     }
   }
 
@@ -409,7 +440,8 @@ export class WechatCaptureService {
       screenCount,
       outputDirectory: run.outputDirectory,
       markdownPath,
-      previewDataUrl
+      previewDataUrl,
+      voiceConversion: run.voiceConversion
     }
     run.sender.send('wechat-capture:event', payload)
   }
@@ -417,6 +449,7 @@ export class WechatCaptureService {
 
 function validateRequest(request: WechatCaptureRequest): void {
   if (!request || typeof request.sourceId !== 'string' || !request.sourceId.startsWith('window:')) throw new Error('请选择有效的目标窗口')
+  validateWechatVoiceOptions(request)
   for (const value of Object.values(request.crop)) if (!Number.isFinite(value) || value < 0 || value > 80) throw new Error('截图区域参数无效')
   if (request.crop.left + request.crop.right >= 90 || request.crop.top + request.crop.bottom >= 90) throw new Error('截图区域过小')
   if (!Number.isInteger(request.scrollStep) || request.scrollStep < 1 || request.scrollStep > 3) throw new Error('滚动步长必须在 1 到 3 之间')

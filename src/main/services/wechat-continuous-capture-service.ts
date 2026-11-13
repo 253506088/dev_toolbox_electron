@@ -10,9 +10,11 @@ import {
   findVerticalOverlap,
   normalizedImageDifference,
   planScreenSlices,
+  validateWechatVoiceOptions,
   type WechatCaptureEvent,
   type WechatContinuousCaptureRequest,
-  type WechatCaptureStartResult
+  type WechatCaptureStartResult,
+  type WechatVoiceConversionStats
 } from '../../shared/wechat-capture'
 import {
   scrollChatToTop,
@@ -25,6 +27,7 @@ import {
 import { nativeCaptureSize } from './capture-resolution'
 import { VideoFrameSourceService } from './video-frame-source-service'
 import { CaptureTimingLog } from './capture-timing-log'
+import { WechatVoicePreparation } from './wechat-voice-preparation'
 
 const LONG_IMAGE_HEIGHT = 20_000
 const STOP_HOTKEY = 'CommandOrControl+E'
@@ -52,6 +55,8 @@ interface ContinuousRun {
   outputDirectory: string
   scroller: ScrollDriver | null
   log: CaptureTimingLog
+  voice?: WechatVoicePreparation<ContinuousFrame>
+  voiceConversion?: WechatVoiceConversionStats
 }
 
 interface FrameReport {
@@ -135,7 +140,8 @@ export class WechatContinuousCaptureService {
       crop: request.crop,
       stableWindowMs: request.frameIntervalMs,
       scrollIntervalMs: request.scrollIntervalMs,
-      maxFrames: request.maxFrames
+      maxFrames: request.maxFrames,
+      convertVoiceToText: request.convertVoiceToText === true
     })
     const run: ContinuousRun = {
       id: crypto.randomUUID(),
@@ -157,8 +163,10 @@ export class WechatContinuousCaptureService {
 
   stop(): void {
     if (!this.activeRun) return
-    this.activeRun.cancelled = true
-    void this.stopScroller(this.activeRun)
+    const run = this.activeRun
+    run.cancelled = true
+    void run.voice?.stop().catch((error: unknown) => run.log.record('voice.stop_failed', undefined, { error: String(error) }))
+    void this.stopScroller(run)
   }
 
   dispose(): void {
@@ -190,6 +198,28 @@ export class WechatContinuousCaptureService {
         mkdir(longDirectory, { recursive: true }),
         mkdir(screenshotsDirectory, { recursive: true })
       ]))
+      const scrollerStartedAt = performance.now()
+      run.scroller = WechatScrollController.start(request.sourceId, request.crop)
+      run.log.record('scroll_driver.start', performance.now() - scrollerStartedAt, { driver: run.scroller.name })
+      if (request.convertVoiceToText) {
+        // 预处理使用原生截图，结束后才打开视频流，避免缓存右键菜单或展开前的帧。
+        run.voice = new WechatVoicePreparation({
+          sourceId: request.sourceId, crop: request.crop, outputDirectory: run.outputDirectory,
+          capture: () => this.capture(request),
+          scroll: (notches) => this.scroll(run, notches, 0, 0),
+          isCancelled: () => run.cancelled || run.sender.isDestroyed(),
+          log: run.log,
+          onProgress: (message, stats) => {
+            run.voiceConversion = stats
+            this.emit(run, 'transcribing', message, 0, 0)
+          }
+        })
+        if (!await run.voice.prepare() || run.cancelled || run.sender.isDestroyed()) {
+          finalStatus = 'stopped'
+          this.emit(run, 'stopped', '语音预处理已停止，尚未生成截图', 0, 0)
+          return
+        }
+      }
       try {
         const opened = await run.log.measure('frame_source.open', () => this.videoFrameSource.open({
           sourceId: request.sourceId,
@@ -223,9 +253,6 @@ export class WechatContinuousCaptureService {
         run.log.record('frame_source.fallback', undefined, { reason: this.frameSourceFallbackReason })
         this.emit(run, 'positioning', `视频流不可用，已降级为兼容模式（较慢）：${this.frameSourceFallbackReason}`, 0, 0)
       }
-      const scrollerStartedAt = performance.now()
-      run.scroller = WechatScrollController.start(request.sourceId, request.crop)
-      run.log.record('scroll_driver.start', performance.now() - scrollerStartedAt, { driver: run.scroller.name })
       const startFromTop = request.startFromTop !== false
       this.emit(
         run,
@@ -464,6 +491,7 @@ export class WechatContinuousCaptureService {
         sourceName: request.sourceName,
         crop: request.crop,
         startFromTop: request.startFromTop !== false,
+        voiceConversion: run.voiceConversion,
         frameIntervalMs: request.frameIntervalMs,
         scrollIntervalMs: request.scrollIntervalMs,
         capturedHeight,
@@ -516,6 +544,8 @@ export class WechatContinuousCaptureService {
         this.emit(run, 'error', message, acceptedFrames, capturedHeight)
       }
     } finally {
+      await run.voice?.stop()
+      await this.stopScroller(run)
       await run.log.measure('frame_source.close', () => this.videoFrameSource.close())
       this.frameSourceMode = 'desktop-capturer'
       if (this.activeRun === run) this.activeRun = null
@@ -523,6 +553,7 @@ export class WechatContinuousCaptureService {
       await run.log.finish(finalStatus, {
         acceptedFrames,
         capturedHeight,
+        voiceConversion: run.voiceConversion,
         reachedBottom,
         error: failure?.message
       })
@@ -871,7 +902,8 @@ export class WechatContinuousCaptureService {
       capturedHeight,
       outputDirectory: run.outputDirectory,
       previewDataUrl,
-      markdownPath
+      markdownPath,
+      voiceConversion: run.voiceConversion
     }
     run.sender.send('wechat-capture:event', payload)
   }
@@ -914,6 +946,7 @@ function frameReport(
 
 function validateRequest(request: WechatContinuousCaptureRequest): void {
   if (!request || typeof request.sourceId !== 'string' || !request.sourceId.startsWith('window:')) throw new Error('请选择有效的目标窗口')
+  validateWechatVoiceOptions(request)
   for (const value of Object.values(request.crop)) if (!Number.isFinite(value) || value < 0 || value > 80) throw new Error('截图区域参数无效')
   if (request.crop.left + request.crop.right >= 90 || request.crop.top + request.crop.bottom >= 90) throw new Error('截图区域过小')
   if (!Number.isInteger(request.frameIntervalMs) || request.frameIntervalMs < 60 || request.frameIntervalMs > 500) throw new Error('稳定判定窗口必须在 60 到 500 毫秒之间')

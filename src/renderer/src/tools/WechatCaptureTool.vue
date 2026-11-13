@@ -15,7 +15,7 @@ import {
   NTag,
   useMessage
 } from 'naive-ui'
-import type { WechatCaptureCrop, WechatCaptureEvent, WechatCaptureMode, WechatWindowSource } from '@shared/wechat-capture'
+import { WECHAT_CAPTURE_API_VERSION, type WechatCaptureCrop, type WechatCaptureEvent, type WechatCaptureMode, type WechatWindowSource } from '@shared/wechat-capture'
 import CropSelector from '../components/CropSelector.vue'
 import ToolPage from '../components/ToolPage.vue'
 import WechatExportTools from '../components/WechatExportTools.vue'
@@ -31,6 +31,8 @@ const captureMode = ref<WechatCaptureMode>('continuous')
 const crop = reactive<WechatCaptureCrop>({ left: 31, top: 9, right: 2, bottom: 25 })
 const zoomVisible = ref(false)
 const startFromTop = ref(true)
+const convertVoiceToText = ref(false)
+const voiceConversion = ref<WechatCaptureEvent['voiceConversion']>()
 const scrollStep = ref(2)
 const settleDelayMs = ref(350)
 const maxScreens = ref(300)
@@ -44,11 +46,16 @@ const previewAreaSize = reactive({ width: 0, height: 0 })
 let previewAreaObserver: ResizeObserver | undefined
 
 const selectedWindow = computed(() => windows.value.find((item) => item.id === selectedId.value) ?? null)
+const isWechatWindow = computed(() => selectedWindow.value?.application === 'wechat')
+const canConvertVoice = computed(() => isWechatWindow.value && startFromTop.value)
 const windowOptions = computed(() => windows.value.map((item) => ({
   label: `[${item.applicationLabel || '其他'}] ${item.name}${isWindowCapturable(item) ? '' : '（需恢复窗口后刷新）'}`,
   value: item.id
 })))
-const isFinished = computed(() => progress.value?.stage === 'complete' || progress.value?.stage === 'stopped')
+const isFinished = computed(() =>
+  (progress.value?.stage === 'complete' || progress.value?.stage === 'stopped') &&
+  ((progress.value?.screenCount ?? 0) > 0 || (progress.value?.capturedHeight ?? 0) > 0)
+)
 
 /** 按可用区域和窗口宽高比取“contain”最大尺寸，让预览铺满工作区。 */
 const previewFitStyle = computed(() => {
@@ -64,7 +71,7 @@ async function refreshWindows(): Promise<void> {
   loadingWindows.value = true
   try {
     const listedWindows = await window.electronApi.wechatCapture.listWindows()
-    if (listedWindows.length > 0 && listedWindows.every((item) => item.captureApiVersion !== 2)) {
+    if (listedWindows.length > 0 && listedWindows.every((item) => item.captureApiVersion !== WECHAT_CAPTURE_API_VERSION)) {
       message.warning('Electron 主进程仍是旧版本，请完整退出并重新启动应用')
     }
     windows.value = listedWindows.map((item) => ({
@@ -92,7 +99,12 @@ async function chooseOutputDirectory(): Promise<void> {
 /** 用当前窗口、截图区域和滚动参数启动任务。 */
 async function startCapture(): Promise<void> {
   if (!selectedWindow.value || !isWindowCapturable(selectedWindow.value) || running.value) return
+  if (canConvertVoice.value && convertVoiceToText.value && selectedWindow.value.captureApiVersion !== WECHAT_CAPTURE_API_VERSION) {
+    message.error('语音转文字需要新版主进程，请完整退出并重新启动应用')
+    return
+  }
   running.value = true
+  voiceConversion.value = undefined
   progress.value = { runId: '', stage: 'positioning', message: '正在启动...', screenCount: 0 }
   try {
     const common = {
@@ -100,7 +112,8 @@ async function startCapture(): Promise<void> {
       sourceName: selectedWindow.value.name,
       outputDirectory: outputDirectory.value,
       crop: { ...crop },
-      startFromTop: startFromTop.value
+      startFromTop: startFromTop.value,
+      convertVoiceToText: canConvertVoice.value && convertVoiceToText.value
     }
     const result = captureMode.value === 'continuous'
       ? await window.electronApi.wechatCapture.startContinuous({
@@ -128,8 +141,11 @@ async function startCapture(): Promise<void> {
 
 /** 停止自动滚动，主进程仍会把已有分屏生成长图和 Markdown。 */
 async function stopCapture(): Promise<void> {
+  const wasTranscribing = progress.value?.stage === 'transcribing'
   await window.electronApi.wechatCapture.stop()
-  if (progress.value) progress.value.message = '正在停止并保存...'
+  if (running.value && progress.value) {
+    progress.value.message = wasTranscribing ? '正在停止语音转写...' : '正在停止并保存...'
+  }
 }
 
 function openOutput(): void {
@@ -147,7 +163,13 @@ function applyCrop(value: WechatCaptureCrop): void {
 }
 
 watch(selectedId, () => {
-  if (!running.value) applyCrop(profileCrop(selectedWindow.value?.application))
+  if (running.value) return
+  applyCrop(profileCrop(selectedWindow.value?.application))
+  convertVoiceToText.value = canConvertVoice.value
+})
+
+watch(canConvertVoice, (enabled) => {
+  if (!enabled) convertVoiceToText.value = false
 })
 
 function profileCrop(application?: WechatWindowSource['application']): WechatCaptureCrop {
@@ -179,9 +201,10 @@ onMounted(async () => {
   )
   unsubscribe = window.electronApi.wechatCapture.onEvent((event) => {
     progress.value = event
+    if (event.voiceConversion) voiceConversion.value = event.voiceConversion
     running.value = !['complete', 'stopped', 'error'].includes(event.stage)
-    if (event.stage === 'complete') message.success('滚动长截图已完成')
-    if (event.stage === 'stopped') message.info('截图已停止，已有内容已保存')
+    if (event.stage === 'complete') message.success(event.message)
+    if (event.stage === 'stopped') message.info(event.message)
     if (event.stage === 'error') message.error(event.message)
   })
   outputDirectory.value = await window.electronApi.wechatCapture.defaultOutputDirectory()
@@ -253,10 +276,17 @@ function formatError(error: unknown): string {
         <div v-else class="empty-preview">请打开目标窗口后刷新</div>
 
         <section class="capture-status" :class="{ visible: progress }" aria-live="polite">
-          <div>
+          <div class="capture-status-heading">
             <strong>{{ progress?.message || '等待开始' }}</strong>
-            <span v-if="captureMode === 'continuous'">{{ (progress?.capturedHeight ?? 0).toLocaleString('zh-CN') }} px</span>
+            <span v-if="progress?.stage === 'transcribing'">语音预处理</span>
+            <span v-else-if="captureMode === 'continuous'">{{ (progress?.capturedHeight ?? 0).toLocaleString('zh-CN') }} px</span>
             <span v-else>{{ progress?.screenCount ?? 0 }} 屏</span>
+          </div>
+          <div v-if="voiceConversion" class="voice-progress" role="status" aria-label="语音转写统计">
+            <span>已扫描 <b>{{ voiceConversion.scannedPages }}</b> 屏</span>
+            <span>已转写 <b>{{ voiceConversion.converted }}</b> 条</span>
+            <span>已展开 <b>{{ voiceConversion.alreadyConverted }}</b> 次</span>
+            <span :class="{ 'voice-failed': voiceConversion.failed > 0 }">未成功 <b>{{ voiceConversion.failed }}</b> 条</span>
           </div>
           <NProgress
             v-if="running"
@@ -290,6 +320,12 @@ function formatError(error: unknown): string {
         <h2>{{ captureMode === 'continuous' ? '连续采集参数' : '抓取参数' }}</h2>
         <NCheckbox v-model:checked="startFromTop" :disabled="running">先回到内容顶部再开始</NCheckbox>
         <p class="option-hint">取消勾选则从当前位置向下截到底部</p>
+        <div v-if="isWechatWindow" class="voice-option">
+          <NCheckbox v-model:checked="convertVoiceToText" :disabled="running || !canConvertVoice">自动将语音转为文字</NCheckbox>
+          <p v-if="!startFromTop" class="option-hint">自动转写需要先回到顶部；从当前位置截图时不进行转写。</p>
+          <p v-else class="option-hint">先逐屏右键语音并选择“语音转文字”，等待文字展开，再回顶生成长图。</p>
+          <p v-if="convertVoiceToText" class="voice-note">请保持微信聊天窗口可见，转写时避免操作鼠标或切换聊天。按 Ctrl+E 可随时停止。</p>
+        </div>
         <template v-if="captureMode === 'continuous'">
           <div class="number-grid">
             <label>稳定判定窗口<NInputNumber v-model:value="frameIntervalMs" :min="60" :max="500" :step="20" :disabled="running" /></label>
@@ -348,9 +384,12 @@ function formatError(error: unknown): string {
 .window-preview { flex: none; }
 .empty-preview { display: grid; flex: 1; place-items: center; min-height: 300px; color: var(--text-muted); border: 1px dashed var(--border-color); border-radius: 5px; }
 .capture-status { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; min-height: 54px; gap: 10px; padding-top: 10px; border-top: 1px solid var(--border-color); }
-.capture-status > div { display: flex; justify-content: space-between; gap: 16px; }
-.capture-status strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.capture-status-heading { display: flex; grid-column: 1 / -1; align-items: baseline; justify-content: space-between; gap: 16px; min-width: 0; }
+.capture-status strong { overflow-wrap: anywhere; }
 .capture-status span { flex: none; color: var(--text-muted); }
+.voice-progress { display: flex; grid-column: 1 / -1; flex-wrap: wrap; gap: 6px 18px; font-size: var(--ui-font-sm); }
+.voice-progress b { color: var(--text-color); font-variant-numeric: tabular-nums; }
+.voice-progress .voice-failed, .voice-progress .voice-failed b { color: #d97706; }
 .capture-status :deep(.n-progress) { grid-column: 1 / -1; }
 .capture-status > img { width: 56px; height: 40px; object-fit: cover; border: 1px solid var(--border-color); border-radius: 3px; }
 .capture-controls { display: flex; flex-direction: column; min-width: 0; gap: 9px; overflow: auto; padding: 2px 2px 14px 16px; border-left: 1px solid var(--border-color); }
@@ -359,6 +398,9 @@ function formatError(error: unknown): string {
 .control-heading { display: flex; align-items: center; justify-content: space-between; }
 .control-divider { height: 1px; margin: 5px 0; background: var(--border-color); }
 .option-hint { margin: -4px 0 0; color: var(--text-muted); font-size: var(--ui-font-xs); }
+.voice-option { display: flex; flex-direction: column; gap: 8px; padding: 10px; border: 1px solid var(--border-color); border-radius: 5px; }
+.voice-option .option-hint { margin: 0; line-height: 1.65; }
+.voice-note { margin: 0; color: var(--text-muted); font-size: var(--ui-font-xs); line-height: 1.65; }
 .number-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
 .path-button { display: flex; align-items: center; width: 100%; min-height: 36px; gap: 8px; padding: 6px 10px; border: 1px solid var(--border-color); border-radius: 4px; color: var(--text-color); background: transparent; cursor: pointer; }
 .path-button:hover:not(:disabled) { border-color: var(--accent-color); }
