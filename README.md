@@ -13,6 +13,8 @@ pnpm dev
 
 ## 检查与构建
 
+Windows 下直接双击根目录的 [一键打包.bat](一键打包.bat)，即可生成安装版和绿色版。脚本会检查 Node.js 24+、同步依赖、准备 FFmpeg，再执行完整打包；完成后自动打开 `dist/`，失败时保留窗口和错误信息。首次使用需要联网，已有 pnpm 或 Corepack 均可运行。找不到 FFmpeg 时，可按窗口提示拖入 `ffmpeg.exe`。
+
 ```powershell
 pnpm test
 pnpm typecheck

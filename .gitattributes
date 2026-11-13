@@ -1,0 +1,2 @@
+# Keep the Windows double-click entry point in CMD-compatible line endings.
+*.bat text eol=crlf
