@@ -21,7 +21,7 @@ describe.skipIf(process.platform !== 'win32' || process.env.WECHAT_VOICE_NATIVE_
       const exe = join(directory, 'WeChat.exe')
       await writeFile(source, '\ufeff' + fixtureSource, 'utf8')
       await writeFile(compiler, `param([string]$Source, [string]$Output)\n$ErrorActionPreference = 'Stop'\nAdd-Type -Path $Source -ReferencedAssemblies System.Windows.Forms,System.Drawing -OutputAssembly $Output -OutputType WindowsApplication\n`, 'utf8')
-      await exec('powershell.exe', ['-NoProfile', '-NonInteractive', '-File', compiler, source, exe], { windowsHide: true })
+      await exec('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', compiler, source, exe], { windowsHide: true })
       child = spawn(exe, [directory], { windowsHide: true, stdio: 'ignore' })
       const handle = await waitForFile(join(directory, 'handle.txt'))
       controller = WechatVoiceController.start(`window:${handle.trim()}:0`, { left: 3, top: 10, right: 3, bottom: 5 })

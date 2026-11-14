@@ -1,5 +1,5 @@
-/** 增加语音预处理能力时同步升级，提示开发环境完整重启旧主进程。 */
-export const WECHAT_CAPTURE_API_VERSION = 3
+/** 逐屏按需转写协议；提示开发环境完整重启旧主进程。 */
+export const WECHAT_CAPTURE_API_VERSION = 4
 
 /** 可供滚动截图工具选择的桌面窗口。 */
 export interface WechatWindowSource {
@@ -34,9 +34,9 @@ export interface WechatCaptureRequest {
   scrollStep: number
   settleDelayMs: number
   maxScreens: number
-  /** 为 false 时不回顶，从当前位置向下截到底部；缺省按 true 处理。 */
+  /** 默认从当前位置向下截图；仅显式为 true 时回到顶部。 */
   startFromTop?: boolean
-  /** 截图前逐屏展开微信语音文字；要求从顶部开始。 */
+  /** 每屏截图前展开当前可见语音；支持从当前位置开始。 */
   convertVoiceToText?: boolean
 }
 
@@ -51,9 +51,9 @@ export interface WechatContinuousCaptureRequest {
   maxFrames: number
   /** 窗口枚举时得到的预览尺寸，用于拦截低分辨率视频流。 */
   expectedSize?: { width: number; height: number }
-  /** 为 false 时不回顶，从当前位置向下截到底部；缺省按 true 处理。 */
+  /** 默认从当前位置向下截图；仅显式为 true 时回到顶部。 */
   startFromTop?: boolean
-  /** 截图前逐屏展开微信语音文字；要求从顶部开始。 */
+  /** 每屏截图前展开当前可见语音；支持从当前位置开始。 */
   convertVoiceToText?: boolean
 }
 
@@ -70,11 +70,11 @@ export interface WechatVoiceConversionStats {
 
 /** 同时供两种采集模式校验，避免隐式改变用户选择的截图起点。 */
 export function validateWechatVoiceOptions(request: { convertVoiceToText?: boolean; startFromTop?: boolean }): void {
+  if (request.startFromTop !== undefined && typeof request.startFromTop !== 'boolean') {
+    throw new Error('截图起点参数无效')
+  }
   if (request.convertVoiceToText !== undefined && typeof request.convertVoiceToText !== 'boolean') {
     throw new Error('语音转文字参数无效')
-  }
-  if (request.convertVoiceToText && request.startFromTop === false) {
-    throw new Error('自动语音转文字需要先回到内容顶部；从当前位置截图请关闭此选项')
   }
 }
 

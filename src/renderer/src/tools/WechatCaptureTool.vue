@@ -30,7 +30,7 @@ const progress = ref<WechatCaptureEvent | null>(null)
 const captureMode = ref<WechatCaptureMode>('continuous')
 const crop = reactive<WechatCaptureCrop>({ left: 31, top: 9, right: 2, bottom: 25 })
 const zoomVisible = ref(false)
-const startFromTop = ref(true)
+const startFromTop = ref(false)
 const convertVoiceToText = ref(false)
 const voiceConversion = ref<WechatCaptureEvent['voiceConversion']>()
 const scrollStep = ref(2)
@@ -47,7 +47,7 @@ let previewAreaObserver: ResizeObserver | undefined
 
 const selectedWindow = computed(() => windows.value.find((item) => item.id === selectedId.value) ?? null)
 const isWechatWindow = computed(() => selectedWindow.value?.application === 'wechat')
-const canConvertVoice = computed(() => isWechatWindow.value && startFromTop.value)
+const canConvertVoice = computed(() => isWechatWindow.value)
 const windowOptions = computed(() => windows.value.map((item) => ({
   label: `[${item.applicationLabel || '其他'}] ${item.name}${isWindowCapturable(item) ? '' : '（需恢复窗口后刷新）'}`,
   value: item.id
@@ -144,7 +144,7 @@ async function stopCapture(): Promise<void> {
   const wasTranscribing = progress.value?.stage === 'transcribing'
   await window.electronApi.wechatCapture.stop()
   if (running.value && progress.value) {
-    progress.value.message = wasTranscribing ? '正在停止语音转写...' : '正在停止并保存...'
+    progress.value.message = wasTranscribing ? '正在停止语音转写并保存已截内容...' : '正在停止并保存...'
   }
 }
 
@@ -278,12 +278,12 @@ function formatError(error: unknown): string {
         <section class="capture-status" :class="{ visible: progress }" aria-live="polite">
           <div class="capture-status-heading">
             <strong>{{ progress?.message || '等待开始' }}</strong>
-            <span v-if="progress?.stage === 'transcribing'">语音预处理</span>
+            <span v-if="progress?.stage === 'transcribing'">本屏语音转写</span>
             <span v-else-if="captureMode === 'continuous'">{{ (progress?.capturedHeight ?? 0).toLocaleString('zh-CN') }} px</span>
             <span v-else>{{ progress?.screenCount ?? 0 }} 屏</span>
           </div>
           <div v-if="voiceConversion" class="voice-progress" role="status" aria-label="语音转写统计">
-            <span>已扫描 <b>{{ voiceConversion.scannedPages }}</b> 屏</span>
+            <span>已检查 <b>{{ voiceConversion.scannedPages }}</b> 屏</span>
             <span>已转写 <b>{{ voiceConversion.converted }}</b> 条</span>
             <span>已展开 <b>{{ voiceConversion.alreadyConverted }}</b> 次</span>
             <span :class="{ 'voice-failed': voiceConversion.failed > 0 }">未成功 <b>{{ voiceConversion.failed }}</b> 条</span>
@@ -319,11 +319,10 @@ function formatError(error: unknown): string {
         <div class="control-divider" />
         <h2>{{ captureMode === 'continuous' ? '连续采集参数' : '抓取参数' }}</h2>
         <NCheckbox v-model:checked="startFromTop" :disabled="running">先回到内容顶部再开始</NCheckbox>
-        <p class="option-hint">取消勾选则从当前位置向下截到底部</p>
+        <p class="option-hint">默认从当前位置向下截图；需要完整记录时可勾选回到顶部。</p>
         <div v-if="isWechatWindow" class="voice-option">
           <NCheckbox v-model:checked="convertVoiceToText" :disabled="running || !canConvertVoice">自动将语音转为文字</NCheckbox>
-          <p v-if="!startFromTop" class="option-hint">自动转写需要先回到顶部；从当前位置截图时不进行转写。</p>
-          <p v-else class="option-hint">先逐屏右键语音并选择“语音转文字”，等待文字展开，再回顶生成长图。</p>
+          <p class="option-hint">每屏截图前检查未转文字的语音，转写完成并稳定后再截图，然后继续向下。</p>
           <p v-if="convertVoiceToText" class="voice-note">请保持微信聊天窗口可见，转写时避免操作鼠标或切换聊天。按 Ctrl+E 可随时停止。</p>
         </div>
         <template v-if="captureMode === 'continuous'">

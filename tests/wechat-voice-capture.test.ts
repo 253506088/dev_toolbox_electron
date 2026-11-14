@@ -7,16 +7,21 @@ interface PreparationOptions {
   onProgress: (message: string, stats: WechatVoiceConversionStats) => void
 }
 
+interface TestFrame { buffer: Buffer; width: number; height: number; fingerprint: Uint8Array; fingerprintWidth: number; fingerprintHeight: number }
+
 // Keep native input, Electron capture and disk output behind observable boundaries.
 // The capture services themselves run their real start/stop/output lifecycle.
 const mocks = vi.hoisted(() => ({
   mkdir: vi.fn(),
   writeFile: vi.fn(),
   imageFile: vi.fn(),
+  extract: vi.fn(),
+  topInset: 0,
   getSources: vi.fn(),
   register: vi.fn(),
   unregister: vi.fn(),
-  prepare: vi.fn<(options: PreparationOptions) => Promise<WechatVoiceConversionStats | null>>(),
+  prepare: vi.fn<(options: PreparationOptions, frame: TestFrame) => Promise<TestFrame | null>>(),
+  voiceFinish: vi.fn(),
   voiceStop: vi.fn(),
   position: vi.fn(),
   scroll: vi.fn(),
@@ -50,7 +55,7 @@ vi.mock('sharp', () => ({
   default: () => {
     const pipeline = {
       metadata: async () => ({ width: 100, height: 100 }),
-      extract: () => pipeline,
+      extract: (region: unknown) => { mocks.extract(region); return pipeline },
       resize: () => pipeline,
       grayscale: () => pipeline,
       raw: () => pipeline,
@@ -101,7 +106,9 @@ vi.mock('../src/main/services/capture-timing-log', () => ({
 vi.mock('../src/main/services/wechat-voice-preparation', () => ({
   WechatVoicePreparation: class {
     constructor(private readonly options: PreparationOptions) {}
-    prepare(): Promise<WechatVoiceConversionStats | null> { return mocks.prepare(this.options) }
+    prepare(frame: TestFrame): Promise<TestFrame | null> { return mocks.prepare(this.options, frame) }
+    finish = mocks.voiceFinish
+    get topInset(): number { return mocks.topInset }
     stop = mocks.voiceStop
   }
 }))
@@ -124,7 +131,7 @@ function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void; reje
   return { promise, resolve, reject }
 }
 
-function createSession(mode: 'paged' | 'continuous') {
+function createSession(mode: 'paged' | 'continuous', stopAtCapture = 1) {
   const events: WechatCaptureEvent[] = []
   const service = mode === 'paged' ? new WechatCaptureService() : new WechatContinuousCaptureService()
   const sender = {
@@ -132,7 +139,7 @@ function createSession(mode: 'paged' | 'continuous') {
     send: (_channel: string, event: WechatCaptureEvent) => {
       events.push(event)
       // One captured screen is sufficient to verify the transition and saved output.
-      if (event.stage === 'capturing') service.stop()
+      if (event.stage === 'capturing' && event.screenCount >= stopAtCapture) service.stop()
     }
   } as unknown as WebContents
   return {
@@ -157,9 +164,10 @@ async function finished(): Promise<void> {
   await vi.waitFor(() => expect(mocks.finish).toHaveBeenCalledOnce())
 }
 
-describe.each(['paged', 'continuous'] as const)('%s 语音预处理与截图生命周期', (mode) => {
+describe.each(['paged', 'continuous'] as const)('%s 逐屏语音处理与截图生命周期', (mode) => {
   beforeEach(() => {
     vi.clearAllMocks()
+    mocks.topInset = 0
     Object.defineProperty(process, 'platform', { value: 'win32', configurable: true })
     mocks.mkdir.mockResolvedValue(undefined)
     mocks.writeFile.mockResolvedValue(undefined)
@@ -168,11 +176,13 @@ describe.each(['paged', 'continuous'] as const)('%s 语音预处理与截图生�
     mocks.scroll.mockResolvedValue(undefined)
     mocks.scrollStop.mockResolvedValue(undefined)
     mocks.voiceStop.mockResolvedValue(undefined)
+    mocks.voiceFinish.mockResolvedValue(undefined)
+    mocks.getSources.mockResolvedValue([{ id: common.sourceId, thumbnail: { isEmpty: () => false, toPNG: () => Buffer.from('png') } }])
     mocks.videoOpen.mockResolvedValue({ width: 100, height: 100, meetsMinimumSize: true })
     mocks.videoClose.mockResolvedValue(undefined)
     mocks.finish.mockResolvedValue(undefined)
     mocks.position.mockImplementation(async () => mocks.frame)
-    mocks.prepare.mockResolvedValue(stats)
+    mocks.prepare.mockImplementation(async (options, frame) => { options.onProgress('本屏检查完成', stats); return frame })
   })
 
   afterEach(() => { Object.defineProperty(process, 'platform', platformDescriptor) })
@@ -188,8 +198,8 @@ describe.each(['paged', 'continuous'] as const)('%s 语音预处理与截图生�
     expect(session.events.at(-1)?.markdownPath).toMatch(/\.md$/)
   })
 
-  it('转写完成前不定位截图首帧、不写入图像或开启视频流，完成后保留统计', async () => {
-    const gate = deferred<WechatVoiceConversionStats | null>()
+  it('先定位所选起点，当前屏转写完成前不写图像，完成后立即截图', async () => {
+    const gate = deferred<TestFrame | null>()
     mocks.prepare.mockImplementation(async (options) => {
       options.onProgress('正在转写', stats)
       return gate.promise
@@ -198,22 +208,22 @@ describe.each(['paged', 'continuous'] as const)('%s 语音预处理与截图生�
     await session.start()
     await vi.waitFor(() => expect(mocks.prepare).toHaveBeenCalledOnce())
     expect(writtenImages()).toEqual([])
-    expect(mocks.position).not.toHaveBeenCalled()
-    expect(mocks.videoOpen).not.toHaveBeenCalled()
+    expect(mocks.position).toHaveBeenCalledOnce()
     expect(session.events.at(-1)?.stage).toBe('transcribing')
 
-    gate.resolve(stats)
+    gate.resolve(mocks.frame)
     await finished()
     expect(writtenImages().length).toBeGreaterThan(0)
     expect(session.events.find((event) => event.stage === 'capturing')?.voiceConversion).toEqual(stats)
     expect(session.events.at(-1)?.voiceConversion).toEqual(stats)
     expect(mocks.voiceStop).toHaveBeenCalled()
+    expect(mocks.voiceFinish).toHaveBeenCalledWith('stopped', undefined)
     expect(mocks.scrollStop).toHaveBeenCalled()
     expect(mocks.unregister).toHaveBeenCalledWith('CommandOrControl+E')
   })
 
-  it('预处理期间停止会取消转换并且不生成截图', async () => {
-    const gate = deferred<WechatVoiceConversionStats | null>()
+  it('首屏语音处理期间停止会取消转换且不写入未完成画面', async () => {
+    const gate = deferred<TestFrame | null>()
     mocks.prepare.mockReturnValue(gate.promise)
     mocks.voiceStop.mockImplementation(async () => { gate.resolve(null) })
     const session = createSession(mode)
@@ -222,47 +232,83 @@ describe.each(['paged', 'continuous'] as const)('%s 语音预处理与截图生�
     session.stop()
     await finished()
     expect(mocks.voiceStop).toHaveBeenCalled()
-    expect(mocks.videoOpen).not.toHaveBeenCalled()
     expect(writtenImages()).toEqual([])
     expect(session.events.at(-1)).toMatchObject({ stage: 'stopped', screenCount: 0 })
     expect(session.events.some((event) => event.stage === 'capturing')).toBe(false)
   })
 
-  it('预处理失败反馈错误并且不开始采集', async () => {
+  it('首屏语音处理失败反馈错误且不写入未完成画面', async () => {
     mocks.prepare.mockRejectedValue(new Error('微信语音转写超时'))
     const session = createSession(mode)
     await session.start()
     await finished()
     expect(writtenImages()).toEqual([])
-    expect(mocks.videoOpen).not.toHaveBeenCalled()
-    expect(mocks.position).not.toHaveBeenCalled()
     expect(session.events.at(-1)).toMatchObject({ stage: 'error', message: '微信语音转写超时', screenCount: 0 })
-    expect(mocks.voiceStop).toHaveBeenCalled()
+    expect(mocks.voiceFinish).toHaveBeenCalledWith('error', '微信语音转写超时')
     expect(mocks.scrollStop).toHaveBeenCalled()
   })
 
-  it('停止后即使在途预处理返回成功也不恢复采集', async () => {
-    const gate = deferred<WechatVoiceConversionStats | null>()
+  it('停止后即使在途本屏处理返回成功也不恢复采集', async () => {
+    const gate = deferred<TestFrame | null>()
     mocks.prepare.mockReturnValue(gate.promise)
     const session = createSession(mode)
     await session.start()
     await vi.waitFor(() => expect(mocks.prepare).toHaveBeenCalledOnce())
     session.stop()
-    gate.resolve(stats)
+    gate.resolve(mocks.frame)
     await finished()
-    expect(mocks.videoOpen).not.toHaveBeenCalled()
-    expect(mocks.position).not.toHaveBeenCalled()
     expect(writtenImages()).toEqual([])
     expect(session.events.at(-1)?.stage).toBe('stopped')
   })
 
-  it('拒绝从当前位置截图与自动转写组合，且不会创建任务或操作窗口', async () => {
+  it.each([false, undefined])('起点参数为 %s 时从当前位置逐屏自动转写，不回到聊天顶部', async (startFromTop) => {
     const session = createSession(mode)
-    await expect(session.start({ startFromTop: false })).rejects.toThrow('顶部')
+    await session.start({ startFromTop })
+    await finished()
+    expect(mocks.position).not.toHaveBeenCalled()
+    expect(mocks.prepare).toHaveBeenCalledOnce()
+    expect(writtenImages().length).toBeGreaterThan(0)
+    expect(session.events.at(-1)?.markdownPath).toMatch(/\.md$/)
+  })
+
+  it('拒绝非布尔起点参数，防止字符串 false 触发意外回顶', async () => {
+    const session = createSession(mode)
+    await expect(session.start({ startFromTop: 'false' as unknown as boolean })).rejects.toThrow('截图起点参数无效')
     expect(mocks.mkdir).not.toHaveBeenCalled()
-    expect(mocks.register).not.toHaveBeenCalled()
+    expect(mocks.position).not.toHaveBeenCalled()
     expect(mocks.prepare).not.toHaveBeenCalled()
-    expect(mocks.videoOpen).not.toHaveBeenCalled()
-    expect(writtenImages()).toEqual([])
+  })
+
+  it('后续屏转写中停止仍保存之前完成的长图和 Markdown', async () => {
+    const gate = deferred<TestFrame | null>()
+    mocks.prepare.mockImplementationOnce(async (_options, frame) => frame).mockReturnValue(gate.promise)
+    const session = createSession(mode, 99)
+    await session.start()
+    await vi.waitFor(() => expect(mocks.prepare).toHaveBeenCalledTimes(2))
+    session.stop()
+    gate.resolve(null)
+    await finished()
+    expect(session.events.at(-1)).toMatchObject({ stage: 'stopped', screenCount: 1 })
+    expect(session.events.at(-1)?.markdownPath).toMatch(/\.md$/)
+    expect(writtenImages().some((path) => path.includes('long'))).toBe(true)
+  })
+
+  it('后续屏转写失败保留已完成截图且最终报告错误', async () => {
+    mocks.prepare.mockImplementationOnce(async (_options, frame) => frame).mockRejectedValue(new Error('第二屏语音转换失败'))
+    const session = createSession(mode, 99)
+    await session.start()
+    await finished()
+    expect(session.events.at(-1)?.stage).toBe('error')
+    expect(session.events.at(-1)?.message).toContain('第二屏语音转换失败')
+    expect(session.events.at(-1)?.markdownPath).toMatch(/\.md$/)
+  })
+
+  it('首屏局部恢复多露出的旧内容被裁掉，保持用户选择的截图起点', async () => {
+    mocks.topInset = 20
+    const session = createSession(mode)
+    await session.start()
+    await finished()
+    expect(mocks.extract).toHaveBeenCalledWith({ left: 0, top: 20, width: 100, height: mode === 'paged' ? 80 : 50 })
+    expect(session.events.at(-1)?.stage).toBe('stopped')
   })
 })

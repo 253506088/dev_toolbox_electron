@@ -1,13 +1,15 @@
 <script setup lang="ts">
-import { computed, onActivated, onMounted, ref } from 'vue'
-import { CalendarDays, ImagePlus, Plus, Search, Trash2, X } from '@lucide/vue'
+import { computed, onActivated, onBeforeUnmount, onMounted, ref, type Directive } from 'vue'
+import { AlarmClock, CalendarDays, ImagePlus, Plus, Search, Trash2, X } from '@lucide/vue'
 import {
   NButton, NEmpty, NIcon, NInput, NModal, NPopconfirm, NSelect, NSwitch, NTooltip, useMessage
 } from 'naive-ui'
 import type { NoteInput, NoteReminder, ReminderType, StickyNote } from '@shared/electron-api'
+import { hasSameReminderSchedule } from '@shared/reminder-rules'
 import ToolPage from '../components/ToolPage.vue'
 import HolidayCalendar from '../components/HolidayCalendar.vue'
 import NoteImageViewer from '../components/NoteImageViewer.vue'
+import { createMasonryLayout } from '../utils/masonry-layout'
 
 const message = useMessage()
 const notes = ref<StickyNote[]>([])
@@ -30,6 +32,15 @@ const viewerVisible = ref(false)
 const viewerImages = ref<string[]>([])
 const viewerIndex = ref(0)
 const fileInput = ref<HTMLInputElement>()
+const masonry = createMasonryLayout()
+let pendingLoad: Promise<void> | undefined
+
+/** 根据卡片真实高度分配网格行，让后续卡片自动填入当前最短列。 */
+const vMasonryItem: Directive<HTMLElement> = {
+  mounted: (element) => masonry.observe(element),
+  beforeUnmount: (element) => masonry.unobserve(element)
+}
+onBeforeUnmount(() => masonry.disconnect())
 
 const filteredNotes = computed(() => {
   const keyword = search.value.trim().toLowerCase()
@@ -38,8 +49,9 @@ const filteredNotes = computed(() => {
 
 const reminderOptions = [
   { label: '单次提醒', value: 'once' },
-  { label: '日期范围', value: 'dateRange' },
-  { label: '工作日', value: 'workday' }
+  { label: '每日提醒', value: 'daily' },
+  { label: '工作日提醒', value: 'workday' },
+  { label: '日期范围', value: 'dateRange' }
 ]
 
 /** 首次进入页面时读取便签。 */
@@ -50,6 +62,17 @@ onActivated(() => void loadNotes())
 
 /** 从主进程读取全部便签。 */
 async function loadNotes(): Promise<void> {
+  // KeepAlive 首次进入同时调用 mounted 和 activated，共用同一次读取。
+  if (pendingLoad) return pendingLoad
+  pendingLoad = fetchNotes()
+  try {
+    await pendingLoad
+  } finally {
+    pendingLoad = undefined
+  }
+}
+
+async function fetchNotes(): Promise<void> {
   loading.value = true
   try {
     notes.value = await window.electronApi.notes.list()
@@ -81,7 +104,7 @@ function openEdit(note: StickyNote): void {
   editorContent.value = note.content
   editorImages.value = [...note.imageNames]
   temporaryImages.value = []
-  editorReminderEnabled.value = Boolean(note.reminder)
+  editorReminderEnabled.value = Boolean(note.reminder?.enabled)
   reminderType.value = note.reminder?.type ?? 'once'
   reminderTime.value = `${String(note.reminder?.hour ?? 9).padStart(2, '0')}:${String(note.reminder?.minute ?? 0).padStart(2, '0')}`
   onceDate.value = note.reminder?.onceDate ?? formatDate(new Date())
@@ -133,19 +156,6 @@ function buildReminder(): NoteReminder | undefined {
     reminder.lastTriggered = previous.lastTriggered
   }
   return reminder
-}
-
-/** 判断提醒的触发条件是否完全相同，便签文字变化时保留同日去重状态。 */
-function hasSameReminderSchedule(previous: NoteReminder, current: NoteReminder): boolean {
-  return (
-    previous.type === current.type &&
-    previous.hour === current.hour &&
-    previous.minute === current.minute &&
-    previous.enabled === current.enabled &&
-    previous.onceDate === current.onceDate &&
-    previous.startDate === current.startDate &&
-    previous.endDate === current.endDate
-  )
 }
 
 /** 取消编辑并清理本次会话新增的临时图片。 */
@@ -246,6 +256,15 @@ function formatDate(date: Date): string {
   return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`
 }
 
+/** 生成便签卡片上简短明确的提醒说明。 */
+function formatReminder(reminder: NoteReminder): string {
+  const time = `${String(reminder.hour).padStart(2, '0')}:${String(reminder.minute).padStart(2, '0')}`
+  if (reminder.type === 'daily') return `每日 ${time}`
+  if (reminder.type === 'workday') return `工作日 ${time}`
+  if (reminder.type === 'dateRange') return `日期范围 ${time}`
+  return `${reminder.onceDate ?? '单次'} ${time}`
+}
+
 /** 把未知异常转换成中文提示中的明文。 */
 function formatError(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
@@ -264,28 +283,31 @@ function formatError(error: unknown): string {
     </template>
     <template #status><span class="status-text">{{ filteredNotes.length }} 条</span></template>
 
-    <div ref="scrollHost" class="notes-scroll" tabindex="0" @keydown="handleListKey">
-      <NEmpty v-if="!loading && filteredNotes.length === 0" description="暂无便签" class="notes-empty" />
+    <div ref="scrollHost" class="notes-scroll" tabindex="0" :aria-busy="loading" @keydown="handleListKey">
+      <div v-if="loading && notes.length === 0" class="notes-loading" role="status">正在读取便签…</div>
+      <NEmpty v-else-if="filteredNotes.length === 0" description="暂无便签" class="notes-empty" />
       <div v-else class="notes-columns">
-        <article v-for="note in filteredNotes" :key="note.id" class="note-card" :style="{ background: note.color }" @dblclick="openEdit(note)">
-          <div class="note-card-actions">
-            <NButton size="tiny" quaternary @click="openEdit(note)">编辑</NButton>
-            <NPopconfirm @positive-click="deleteNote(note)"><template #trigger><NButton size="tiny" quaternary type="error"><template #icon><NIcon :component="X" /></template></NButton></template>确定删除这条便签吗？</NPopconfirm>
-          </div>
-          <p>{{ note.content }}</p>
-          <div v-if="note.imageNames.length" class="note-images">
-            <img v-for="(image, index) in note.imageNames.slice(0, 4)" :key="image" :src="`note-image://image/${encodeURIComponent(image)}`" alt="便签图片" @click="openViewer(note.imageNames, index)" />
-          </div>
-          <footer>
-            <span>{{ new Date(note.updatedAt).toLocaleString() }}</span>
-            <span v-if="note.reminder">⏰ {{ String(note.reminder.hour).padStart(2, '0') }}:{{ String(note.reminder.minute).padStart(2, '0') }}</span>
-          </footer>
-        </article>
+        <div v-for="note in filteredNotes" :key="note.id" v-masonry-item class="note-cell">
+          <article class="note-card" :style="{ background: note.color }" @dblclick="openEdit(note)">
+            <div class="note-card-actions">
+              <NButton size="tiny" quaternary @dblclick.stop @click.stop="openEdit(note)">编辑</NButton>
+              <NPopconfirm @positive-click="deleteNote(note)"><template #trigger><NButton size="tiny" quaternary type="error" @dblclick.stop @click.stop><template #icon><NIcon :component="X" /></template></NButton></template>确定删除这条便签吗？</NPopconfirm>
+            </div>
+            <p>{{ note.content }}</p>
+            <div v-if="note.imageNames.length" class="note-images">
+              <img v-for="(image, index) in note.imageNames.slice(0, 4)" :key="image" :src="`note-image://image/${encodeURIComponent(image)}`" alt="便签图片" @dblclick.stop @click.stop="openViewer(note.imageNames, index)" />
+            </div>
+            <footer>
+              <span>{{ new Date(note.updatedAt).toLocaleString() }}</span>
+              <span v-if="note.reminder" class="note-reminder"><AlarmClock :size="13" />{{ formatReminder(note.reminder) }}</span>
+            </footer>
+          </article>
+        </div>
       </div>
     </div>
   </ToolPage>
 
-  <NModal :show="editorVisible" preset="card" :title="editingId ? '编辑便签' : '新建便签'" class="note-editor-modal" :mask-closable="false" @update:show="!$event && cancelEditor()">
+  <NModal :show="editorVisible" preset="card" :title="editingId ? '编辑便签' : '新建便签'" class="note-editor-modal" style="width: min(720px, 94vw)" :mask-closable="false" @update:show="!$event && cancelEditor()">
     <div class="note-editor-drop" @dragover.prevent @drop="handleDrop">
       <textarea v-model="editorContent" rows="8" placeholder="输入便签内容，或粘贴截图..." @paste="handlePaste" />
       <div v-if="editorImages.length" class="editor-image-list">
@@ -300,7 +322,7 @@ function formatError(error: unknown): string {
     <div class="reminder-settings">
       <label><NSwitch v-model:value="editorReminderEnabled" /> 启用提醒</label>
       <template v-if="editorReminderEnabled">
-        <NSelect v-model:value="reminderType" :options="reminderOptions" />
+        <NSelect v-model:value="reminderType" :options="reminderOptions" class="reminder-type" />
         <label>时间<input v-model="reminderTime" type="time" /></label>
         <label v-if="reminderType === 'once'">日期<input v-model="onceDate" type="date" /></label>
         <template v-if="reminderType === 'dateRange'">
@@ -318,17 +340,21 @@ function formatError(error: unknown): string {
 
 <style scoped>
 .notes-search { width: min(280px, 35vw); }
-.notes-scroll { height: 100%; overflow: auto; outline: none; }
+.notes-scroll { height: 100%; overflow: auto; scrollbar-gutter: stable; padding: 2px 3px 12px 2px; outline: none; }
+.notes-loading { padding: 24px; color: var(--text-muted); text-align: center; }
 .notes-empty { margin-top: 18vh; }
-.notes-columns { column-count: 3; column-gap: 12px; }
-.note-card { position: relative; display: inline-block; width: 100%; margin: 0 0 12px; padding: 14px; color: #15312f; break-inside: avoid; border: var(--panel-border); border-radius: 6px; box-shadow: 2px 2px 0 rgb(22 78 72 / 35%); content-visibility: auto; contain-intrinsic-size: 180px; }
+.notes-columns { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(270px, 100%), 1fr)); grid-auto-flow: row dense; grid-auto-rows: 8px; gap: 12px; align-items: start; }
+.note-cell { min-width: 0; }
+/* 在首轮测量前不绘制挤在单行中的卡片，避免文字叠加造成模糊和闪烁。 */
+.note-cell:not([data-masonry-ready]) { visibility: hidden; }
+.note-card { position: relative; width: 100%; padding: 14px; color: #20302f; border: 1px solid rgb(32 48 47 / 28%); border-radius: 6px; box-shadow: 0 2px 7px rgb(22 78 72 / 16%); }
 .note-card p { min-height: 44px; margin: 22px 0 10px; line-height: 1.6; white-space: pre-wrap; overflow-wrap: anywhere; }
 .note-card-actions { position: absolute; top: 5px; right: 5px; display: flex; }
 .note-card-actions :deep(.n-button) { color: #15312f; }
 .note-images { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 5px; }
-.note-images img { width: 100%; aspect-ratio: 4 / 3; object-fit: cover; border: 1px solid rgb(0 0 0 / 20%); cursor: zoom-in; }
-.note-card footer { display: flex; justify-content: space-between; gap: 8px; margin-top: 10px; color: rgb(0 0 0 / 58%); font-size: var(--ui-font-xs); }
-.note-editor-modal { width: min(720px, 94vw); }
+.note-images img { display: block; width: 100%; aspect-ratio: 4 / 3; object-fit: cover; border: 1px solid rgb(0 0 0 / 20%); cursor: zoom-in; }
+.note-card footer { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 6px 10px; margin-top: 12px; padding-top: 9px; color: rgb(0 0 0 / 58%); border-top: 1px solid rgb(32 48 47 / 14%); font-size: var(--ui-font-xs); }
+.note-reminder { display: inline-flex; align-items: center; gap: 4px; white-space: nowrap; }
 .note-editor-drop { display: flex; flex-direction: column; gap: 10px; }
 .note-editor-drop textarea { width: 100%; resize: vertical; padding: 10px; color: var(--text-color); border: 1px solid var(--border-color); border-radius: 4px; background: var(--surface-color); font: inherit; }
 .editor-image-list { display: grid; grid-template-columns: repeat(auto-fill, minmax(90px, 1fr)); gap: 8px; }
@@ -337,9 +363,7 @@ function formatError(error: unknown): string {
 .editor-image-list button { position: absolute; top: 3px; right: 3px; width: 24px; height: 24px; color: white; border: 0; border-radius: 50%; background: rgb(185 28 28 / 88%); cursor: pointer; }
 .reminder-settings { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--border-color); }
 .reminder-settings label { display: flex; align-items: center; gap: 6px; }
+.reminder-type { width: 142px; }
 .reminder-settings input { height: 34px; padding: 0 6px; color: var(--text-color); border: 1px solid var(--border-color); border-radius: 4px; background: var(--surface-color); }
 .modal-actions { display: flex; justify-content: flex-end; gap: 8px; }
-@media (min-width: 1700px) { .notes-columns { column-count: 4; } }
-@media (max-width: 1180px) { .notes-columns { column-count: 2; } }
-@media (max-width: 760px) { .notes-columns { column-count: 1; } }
 </style>

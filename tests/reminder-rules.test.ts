@@ -33,4 +33,9 @@ describe('便签提醒规则', () => {
     expect(shouldTriggerReminder(workday, new Date(2026, 6, 19, 9, 30), true)).toBe(true)
     expect(shouldTriggerReminder(workday, new Date(2026, 6, 19, 9, 30), false)).toBe(false)
   })
+
+  it('每日提醒不依赖工作日结果', () => {
+    const daily = reminder({ type: 'daily', onceDate: undefined })
+    expect(shouldTriggerReminder(daily, new Date(2026, 6, 19, 9, 30), false)).toBe(true)
+  })
 })

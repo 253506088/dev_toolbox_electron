@@ -1,5 +1,5 @@
 /** 提醒类型。 */
-export type ReminderType = 'once' | 'dateRange' | 'workday'
+export type ReminderType = 'once' | 'daily' | 'dateRange' | 'workday'
 
 /** MD5 支持的文本字符编码。 */
 export type Md5Encoding =

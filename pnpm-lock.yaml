@@ -8,24 +8,47 @@ importers:
 
   .:
     dependencies:
-      '@lucide/vue':
-        specifier: 1.25.0
-        version: 1.25.0(vue@3.5.40(typescript@5.9.3))
-      '@types/qrcode':
-        specifier: 1.5.6
-        version: 1.5.6
       csv-parse:
         specifier: 6.1.0
         version: 6.1.0
-      dayjs:
-        specifier: 1.11.21
-        version: 1.11.21
-      fast-xml-parser:
-        specifier: 5.10.1
-        version: 5.10.1
       iconv-lite:
         specifier: ^0.7.3
         version: 0.7.3
+      sharp:
+        specifier: ^0.35.3
+        version: 0.35.3(@types/node@26.1.1)
+    optionalDependencies:
+      '@img/sharp-win32-x64':
+        specifier: 0.35.3
+        version: 0.35.3
+    devDependencies:
+      '@lucide/vue':
+        specifier: 1.25.0
+        version: 1.25.0(vue@3.5.40(typescript@5.9.3))
+      '@types/node':
+        specifier: 26.1.1
+        version: 26.1.1
+      '@types/qrcode':
+        specifier: 1.5.6
+        version: 1.5.6
+      '@vitejs/plugin-vue':
+        specifier: 6.0.8
+        version: 6.0.8(vite@7.3.6(@types/node@26.1.1)(jiti@2.7.0)(lightningcss@1.32.0))(vue@3.5.40(typescript@5.9.3))
+      dayjs:
+        specifier: 1.11.21
+        version: 1.11.21
+      electron:
+        specifier: 43.1.1
+        version: 43.1.1(supports-color@7.2.0)
+      electron-builder:
+        specifier: 26.15.7
+        version: 26.15.7(electron-builder-squirrel-windows@26.15.7)(supports-color@7.2.0)
+      electron-vite:
+        specifier: 5.0.0
+        version: 5.0.0(supports-color@7.2.0)(vite@7.3.6(@types/node@26.1.1)(jiti@2.7.0)(lightningcss@1.32.0))
+      fast-xml-parser:
+        specifier: 5.10.1
+        version: 5.10.1
       monaco-editor:
         specifier: 0.55.1
         version: 0.55.1
@@ -41,37 +64,9 @@ importers:
       qrcode:
         specifier: 1.5.4
         version: 1.5.4
-      sharp:
-        specifier: ^0.35.3
-        version: 0.35.3(@types/node@26.1.1)
       sql-formatter:
         specifier: 15.8.2
         version: 15.8.2
-      vue:
-        specifier: 3.5.40
-        version: 3.5.40(typescript@5.9.3)
-      vuedraggable:
-        specifier: 4.1.0
-        version: 4.1.0(vue@3.5.40(typescript@5.9.3))
-      zxing-wasm:
-        specifier: 3.1.2
-        version: 3.1.2(@types/emscripten@1.41.5)
-    devDependencies:
-      '@types/node':
-        specifier: 26.1.1
-        version: 26.1.1
-      '@vitejs/plugin-vue':
-        specifier: 6.0.8
-        version: 6.0.8(vite@7.3.6(@types/node@26.1.1)(jiti@2.7.0)(lightningcss@1.32.0))(vue@3.5.40(typescript@5.9.3))
-      electron:
-        specifier: 43.1.1
-        version: 43.1.1(supports-color@7.2.0)
-      electron-builder:
-        specifier: 26.15.7
-        version: 26.15.7(electron-builder-squirrel-windows@26.15.7)(supports-color@7.2.0)
-      electron-vite:
-        specifier: 5.0.0
-        version: 5.0.0(supports-color@7.2.0)(vite@7.3.6(@types/node@26.1.1)(jiti@2.7.0)(lightningcss@1.32.0))
       typescript:
         specifier: 5.9.3
         version: 5.9.3
@@ -81,9 +76,18 @@ importers:
       vitest:
         specifier: 4.1.10
         version: 4.1.10(@types/node@26.1.1)(vite@7.3.6(@types/node@26.1.1)(jiti@2.7.0)(lightningcss@1.32.0))
+      vue:
+        specifier: 3.5.40
+        version: 3.5.40(typescript@5.9.3)
       vue-tsc:
         specifier: 3.3.7
         version: 3.3.7(typescript@5.9.3)
+      vuedraggable:
+        specifier: 4.1.0
+        version: 4.1.0(vue@3.5.40(typescript@5.9.3))
+      zxing-wasm:
+        specifier: 3.1.2
+        version: 3.1.2(@types/emscripten@1.41.5)
 
 packages:
 

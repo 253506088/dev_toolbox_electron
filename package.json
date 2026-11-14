@@ -1,6 +1,6 @@
 {
   "name": "dev-toolbox-electron",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "基于 Electron、Vue 3 和 TypeScript 的开发者工具箱",
   "main": "./out/main/index.js",
   "author": "253506088",
@@ -13,38 +13,42 @@
     "start": "electron-vite preview",
     "typecheck": "vue-tsc --noEmit -p tsconfig.web.json && tsc --noEmit -p tsconfig.node.json",
     "test": "vitest run",
+    "smoke:release": "node scripts/smoke-release.cjs",
     "build": "vue-tsc --noEmit -p tsconfig.web.json && tsc --noEmit -p tsconfig.node.json && electron-vite build",
     "pack": "pnpm ffmpeg:prepare && vue-tsc --noEmit -p tsconfig.web.json && tsc --noEmit -p tsconfig.node.json && electron-vite build && electron-builder --dir",
     "dist": "pnpm ffmpeg:prepare && vue-tsc --noEmit -p tsconfig.web.json && tsc --noEmit -p tsconfig.node.json && electron-vite build && electron-builder"
   },
   "dependencies": {
+    "csv-parse": "6.1.0",
+    "iconv-lite": "^0.7.3",
+    "sharp": "^0.35.3"
+  },
+  "optionalDependencies": {
+    "@img/sharp-win32-x64": "0.35.3"
+  },
+  "devDependencies": {
     "@lucide/vue": "1.25.0",
     "@types/qrcode": "1.5.6",
-    "csv-parse": "6.1.0",
+    "@types/node": "26.1.1",
+    "@vitejs/plugin-vue": "6.0.8",
     "dayjs": "1.11.21",
+    "electron": "43.1.1",
+    "electron-builder": "26.15.7",
+    "electron-vite": "5.0.0",
     "fast-xml-parser": "5.10.1",
-    "iconv-lite": "^0.7.3",
     "monaco-editor": "0.55.1",
     "naive-ui": "2.44.1",
     "pdfjs-dist": "^6.1.200",
     "pinia": "4.0.2",
     "qrcode": "1.5.4",
-    "sharp": "^0.35.3",
     "sql-formatter": "15.8.2",
-    "vue": "3.5.40",
-    "vuedraggable": "4.1.0",
-    "zxing-wasm": "3.1.2"
-  },
-  "devDependencies": {
-    "@types/node": "26.1.1",
-    "@vitejs/plugin-vue": "6.0.8",
-    "electron": "43.1.1",
-    "electron-builder": "26.15.7",
-    "electron-vite": "5.0.0",
     "typescript": "5.9.3",
     "vite": "7.3.6",
     "vitest": "4.1.10",
-    "vue-tsc": "3.3.7"
+    "vue": "3.5.40",
+    "vue-tsc": "3.3.7",
+    "vuedraggable": "4.1.0",
+    "zxing-wasm": "3.1.2"
   },
   "packageManager": "pnpm@10.32.1"
 }

@@ -102,6 +102,7 @@ export class WechatCaptureService {
       scrollStep: request.scrollStep,
       settleDelayMs: request.settleDelayMs,
       maxScreens: request.maxScreens,
+      startFromTop: request.startFromTop === true,
       convertVoiceToText: request.convertVoiceToText === true
     })
     const run: ActiveRun = { id: crypto.randomUUID(), cancelled: false, sender, outputDirectory, scroller: null, log }
@@ -145,21 +146,16 @@ export class WechatCaptureService {
         run.voice = new WechatVoicePreparation({
           sourceId: request.sourceId, crop: request.crop, outputDirectory: run.outputDirectory,
           capture: () => this.capture(run, request),
-          scroll: (notches) => this.scroll(run, notches, 0),
+          scroll: (notches) => this.scroll(run, notches, screenPaths.length),
           isCancelled: () => run.cancelled || run.sender.isDestroyed(),
           log: run.log,
           onProgress: (message, stats) => {
             run.voiceConversion = stats
-            this.emit(run, 'transcribing', message, 0)
+            this.emit(run, 'transcribing', message, screenPaths.length)
           }
         })
-        if (!await run.voice.prepare() || run.cancelled || run.sender.isDestroyed()) {
-          finalStatus = 'stopped'
-          this.emit(run, 'stopped', '语音预处理已停止，尚未生成截图', 0)
-          return
-        }
       }
-      const startFromTop = request.startFromTop !== false
+      const startFromTop = request.startFromTop === true
       this.emit(run, 'positioning', startFromTop ? '正在将内容滚动到顶部...' : '从当前位置开始截图...', 0)
       const top = await run.log.measure(startFromTop ? 'position_to_top.total' : 'capture_start_frame.total', () => startFromTop
         ? scrollChatToTop({
@@ -176,9 +172,19 @@ export class WechatCaptureService {
         return
       }
 
-      let frame = top
-      await this.saveScreen(run, frame.buffer, screenshotsDirectory, screenPaths, overlaps, 0)
-      this.emit(run, 'capturing', '已从顶部开始截图，按 Ctrl+E 可停止', screenPaths.length, await this.preview(run, frame.buffer))
+      const preparedTop = run.voice ? await run.voice.prepare(top) : top
+      if (!preparedTop || run.cancelled) {
+        finalStatus = 'stopped'
+        this.emit(run, 'stopped', '截图已停止，尚未生成截图', 0)
+        return
+      }
+      let frame = preparedTop
+      const firstTop = run.voice?.topInset ?? 0
+      const firstBuffer = firstTop > 0
+        ? await sharp(frame.buffer).extract({ left: 0, top: firstTop, width: frame.width, height: frame.height - firstTop }).png().toBuffer()
+        : frame.buffer
+      await this.saveScreen(run, firstBuffer, screenshotsDirectory, screenPaths, overlaps, 0)
+      this.emit(run, 'capturing', startFromTop ? '已从顶部开始截图，按 Ctrl+E 可停止' : '已从当前位置开始截图，按 Ctrl+E 可停止', screenPaths.length, await this.preview(run, frame.buffer))
 
       let unchangedCount = 0
       let reachedBottom = false
@@ -191,9 +197,11 @@ export class WechatCaptureService {
         for (let attempt = 0; attempt < 12 && !run.cancelled; attempt += 1) {
           const iterationStartedAt = performance.now()
           run.log.record('iteration.start', undefined, { screen: screenPaths.length + 1, attempt: attempt + 1 })
-          await this.scroll(run, -(attempt === 0 ? request.scrollStep : 1), screenPaths.length)
+          await this.scroll(run, -(run.voice ? 1 : attempt === 0 ? request.scrollStep : 1), screenPaths.length)
           await run.log.measure('frame.wait_fixed_settle', () => delay(request.settleDelayMs), { delayMs: request.settleDelayMs })
-          const next = await this.capture(run, request)
+          const sampled = await this.capture(run, request)
+          const next = run.voice ? await run.voice.prepare(sampled) : sampled
+          if (!next || run.cancelled) break captureLoop
           const movement = normalizedImageDifference(lastObserved.fingerprint, next.fingerprint)
           run.log.record('frame.compare_movement', undefined, { movement })
           if (movement < 0.0035) {
@@ -235,10 +243,20 @@ export class WechatCaptureService {
             continue captureLoop
           }
 
+          // 语音展开会改变布局；没有可靠重叠时不能盲目把整屏接入长图。
+          if (run.voice && !highOverlapCandidate) {
+            throw new Error('本屏语音处理后无法确认与上一屏连续，已停止以避免截图缺失')
+          }
+
+          if (run.voice && highOverlapCandidate && screenPaths.length + 1 >= request.maxScreens) {
+            await this.saveScreen(run, highOverlapCandidate.frame.buffer, screenshotsDirectory, screenPaths, overlaps, highOverlapCandidate.overlap)
+            break captureLoop
+          }
           if (highOverlapCandidate && screenPaths.length + 1 < request.maxScreens) {
             await this.saveScreen(run, highOverlapCandidate.frame.buffer, screenshotsDirectory, screenPaths, overlaps, highOverlapCandidate.overlap)
             const adjacentMatch = findVerticalOverlap(highOverlapCandidate.frame.fingerprint, next.fingerprint, FINGERPRINT_WIDTH, highOverlapCandidate.frame.fingerprintHeight)
             const adjacentOverlap = acceptedOverlapHeight(adjacentMatch, highOverlapCandidate.frame.height, highOverlapCandidate.frame.fingerprintHeight)
+            if (run.voice && adjacentOverlap === 0) throw new Error('语音处理后相邻画面无法对齐，已停止以避免截图缺失')
             await this.saveScreen(run, next.buffer, screenshotsDirectory, screenPaths, overlaps, adjacentOverlap)
           } else {
             await this.saveScreen(run, next.buffer, screenshotsDirectory, screenPaths, overlaps, 0)
@@ -265,17 +283,27 @@ export class WechatCaptureService {
       const finalMessage = stopped ? '截图已停止，现有内容已保存' : reachedBottom ? '滚动长截图已完成' : '已达到最大分屏数，现有内容已保存'
       this.emit(run, stopped ? 'stopped' : 'complete', finalMessage, screenPaths.length, undefined, markdownPath)
     } catch (error) {
+      let markdownPath: string | undefined
+      if (screenPaths.length > 0) {
+        try {
+          this.emit(run, 'stitching', '正在保存已完成的截图…', screenPaths.length)
+          const longPaths = await this.buildLongImages(screenPaths, overlaps, longDirectory)
+          markdownPath = await this.writeMarkdown(run.outputDirectory, request.sourceName, screenPaths, longPaths, true, false)
+        } catch (saveError) { run.log.record('output.partial_save_failed', undefined, { error: String(saveError) }) }
+      }
       if (run.cancelled) {
         finalStatus = 'stopped'
-        this.emit(run, 'stopped', '截图已停止', screenPaths.length)
+        this.emit(run, 'stopped', screenPaths.length ? '截图已停止，已完成内容已保存' : '截图已停止', screenPaths.length, undefined, markdownPath)
       } else {
         const message = error instanceof Error ? error.message : String(error)
         finalStatus = 'error'
         finalError = message
-        this.emit(run, 'error', message, screenPaths.length)
+        this.emit(run, 'error', screenPaths.length ? `${message}；已保存停止前的截图` : message, screenPaths.length, undefined, markdownPath)
       }
     } finally {
-      await run.voice?.stop()
+      try { await run.voice?.finish(finalStatus, finalError) } catch (error) {
+        run.log.record('voice.finish_failed', undefined, { error: String(error) })
+      }
       await this.stopScroller(run)
       if (this.activeRun === run) this.activeRun = null
       globalShortcut.unregister(STOP_HOTKEY)
@@ -363,9 +391,11 @@ export class WechatCaptureService {
 
     for (let index = 0; index < screenPaths.length; index += 1) {
       const source = await readFile(screenPaths[index])
-      const top = Math.min(metadata.height - 1, Math.max(0, overlaps[index] ?? 0))
+      const sourceMetadata = await sharp(source).metadata()
+      if (!sourceMetadata.height || sourceMetadata.width !== metadata.width) throw new Error('分屏图片尺寸不一致，无法生成长图')
+      const top = Math.min(sourceMetadata.height - 1, Math.max(0, overlaps[index] ?? 0))
       let sourceTop = top
-      let remaining = metadata.height - top
+      let remaining = sourceMetadata.height - top
       while (remaining > 0) {
         const available = LONG_IMAGE_HEIGHT - currentHeight
         const pieceHeight = Math.min(remaining, available)

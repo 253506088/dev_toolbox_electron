@@ -141,6 +141,7 @@ export class WechatContinuousCaptureService {
       stableWindowMs: request.frameIntervalMs,
       scrollIntervalMs: request.scrollIntervalMs,
       maxFrames: request.maxFrames,
+      startFromTop: request.startFromTop === true,
       convertVoiceToText: request.convertVoiceToText === true
     })
     const run: ContinuousRun = {
@@ -202,23 +203,18 @@ export class WechatContinuousCaptureService {
       run.scroller = WechatScrollController.start(request.sourceId, request.crop)
       run.log.record('scroll_driver.start', performance.now() - scrollerStartedAt, { driver: run.scroller.name })
       if (request.convertVoiceToText) {
-        // 预处理使用原生截图，结束后才打开视频流，避免缓存右键菜单或展开前的帧。
+        // 控制器随采集会话复用，每屏完成检查后才允许写入像素条。
         run.voice = new WechatVoicePreparation({
           sourceId: request.sourceId, crop: request.crop, outputDirectory: run.outputDirectory,
           capture: () => this.capture(request),
-          scroll: (notches) => this.scroll(run, notches, 0, 0),
+          scroll: (notches) => this.scroll(run, notches, acceptedFrames, capturedHeight),
           isCancelled: () => run.cancelled || run.sender.isDestroyed(),
           log: run.log,
           onProgress: (message, stats) => {
             run.voiceConversion = stats
-            this.emit(run, 'transcribing', message, 0, 0)
+            this.emit(run, 'transcribing', message, acceptedFrames, capturedHeight)
           }
         })
-        if (!await run.voice.prepare() || run.cancelled || run.sender.isDestroyed()) {
-          finalStatus = 'stopped'
-          this.emit(run, 'stopped', '语音预处理已停止，尚未生成截图', 0, 0)
-          return
-        }
       }
       try {
         const opened = await run.log.measure('frame_source.open', () => this.videoFrameSource.open({
@@ -253,7 +249,7 @@ export class WechatContinuousCaptureService {
         run.log.record('frame_source.fallback', undefined, { reason: this.frameSourceFallbackReason })
         this.emit(run, 'positioning', `视频流不可用，已降级为兼容模式（较慢）：${this.frameSourceFallbackReason}`, 0, 0)
       }
-      const startFromTop = request.startFromTop !== false
+      const startFromTop = request.startFromTop === true
       this.emit(
         run,
         'positioning',
@@ -261,10 +257,11 @@ export class WechatContinuousCaptureService {
         0,
         0
       )
-      const first = await run.log.measure(
+      const sampledFirst = await run.log.measure(
         startFromTop ? 'position_to_top.total' : 'capture_start_frame.total',
         () => startFromTop ? this.positionAtTop(run, request) : this.captureStartFrame(run, request)
       )
+      const first = sampledFirst && run.voice ? await run.voice.prepare(sampledFirst) : sampledFirst
       if (!first || run.cancelled) {
         finalStatus = 'stopped'
         this.emit(run, 'stopped', '连续长截图已停止', 0, 0)
@@ -282,23 +279,25 @@ export class WechatContinuousCaptureService {
 
       const firstRegion = continuousSafeStripRegion(first.height, 1)
       const safeBottom = firstRegion.safeBottom
+      const firstTop = run.voice?.topInset ?? 0
+      if (firstTop >= safeBottom) throw new Error('语音展开后无法在当前视口保留截图起点，请缩小语音处理范围后重试')
       const firstPath = join(stripsDirectory, 'strip_00000.png')
       const firstBuffer = await this.encodeFrame(first)
       writer.push(() =>
         run.log.measure('strip.write', () =>
-          sharp(firstBuffer).extract({ left: 0, top: 0, width: first.width, height: safeBottom }).png().toFile(firstPath),
-        { strip: 0, height: safeBottom })
+          sharp(firstBuffer).extract({ left: 0, top: firstTop, width: first.width, height: safeBottom - firstTop }).png().toFile(firstPath),
+        { strip: 0, height: safeBottom - firstTop })
       )
       stripPaths.push(firstPath)
       report.push({ frame: 0, timestamp: new Date().toISOString(), kind: 'initial', overlap: 0, shift: first.height, score: 0, pulseNotches: 0 })
-      capturedHeight = safeBottom
+      capturedHeight = safeBottom - firstTop
       acceptedFrames = 1
       let previous = first
       let observedFrames = 1
       let stationaryCount = 0
       const bottomThreshold = 3
       let lastPulseAt = 0
-      let pulseNotches = INITIAL_PULSE_NOTCHES
+      let pulseNotches = run.voice ? 1 : INITIAL_PULSE_NOTCHES
 
       this.emit(run, 'capturing', '连续滚动采集中，按 Ctrl+E 可停止', acceptedFrames, capturedHeight, await this.preview(firstBuffer))
 
@@ -324,7 +323,9 @@ export class WechatContinuousCaptureService {
           })
           observedFrames += settled.samples
           if (run.cancelled) break
-          let current = settled.frame
+          const prepared = run.voice ? await run.voice.prepare(settled.frame) : settled.frame
+          if (!prepared || run.cancelled) break
+          let current = prepared
 
           // 底部快速判定：画面与上一接受帧几乎一致时直接按静止处理，不做重叠搜索。
           // 窗口化搜索不包含“零位移”解，聊天背景又高度自相似，到底后容易凑出低分假位移，
@@ -378,7 +379,10 @@ export class WechatContinuousCaptureService {
           for (let retry = 0; decision.kind === 'reject' && retry < 3 && observedFrames < request.maxFrames && !run.cancelled; retry += 1) {
             usedRetry = true
             await delay(Math.max(150, request.frameIntervalMs))
-            current = await this.capture(request)
+            const sampledRetry = await this.capture(request)
+            const preparedRetry = run.voice ? await run.voice.prepare(sampledRetry) : sampledRetry
+            if (!preparedRetry || run.cancelled) break
+            current = preparedRetry
             observedFrames += 1
             match = matchContinuousFrames(previous, current, null)
             decision = continuousFrameDecision(match, previous.height, previous.fingerprintHeight)
@@ -393,6 +397,8 @@ export class WechatContinuousCaptureService {
               shift: decision.shift
             })
           }
+
+          if (run.cancelled) break
 
           if (decision.kind === 'stationary') {
             stationaryCount += 1
@@ -433,7 +439,7 @@ export class WechatContinuousCaptureService {
             if (pixelsPerNotch === null) pixelsPerNotch = measured
             else if (expectedShift === null || decision.shift > expectedShift * 0.3) pixelsPerNotch = pixelsPerNotch * 0.6 + measured * 0.4
           }
-          if (pixelsPerNotch !== null && pixelsPerNotch > 0.1) {
+          if (!run.voice && pixelsPerNotch !== null && pixelsPerNotch > 0.1) {
             pulseNotches = clampInt(Math.round(current.height * TARGET_SHIFT_RATIO / pixelsPerNotch), MIN_PULSE_NOTCHES, MAX_PULSE_NOTCHES)
           }
 
@@ -490,7 +496,7 @@ export class WechatContinuousCaptureService {
         mode: 'continuous',
         sourceName: request.sourceName,
         crop: request.crop,
-        startFromTop: request.startFromTop !== false,
+        startFromTop: request.startFromTop === true,
         voiceConversion: run.voiceConversion,
         frameIntervalMs: request.frameIntervalMs,
         scrollIntervalMs: request.scrollIntervalMs,
@@ -534,6 +540,7 @@ export class WechatContinuousCaptureService {
         this.emit(run, stopped ? 'stopped' : 'complete', message, acceptedFrames, capturedHeight, undefined, markdownPath)
       }
     } catch (error) {
+      if (!run.cancelled && !failure) failure = error instanceof Error ? error : new Error(String(error))
       await this.stopScroller(run)
       if (run.cancelled) {
         finalStatus = 'stopped'
@@ -544,7 +551,9 @@ export class WechatContinuousCaptureService {
         this.emit(run, 'error', message, acceptedFrames, capturedHeight)
       }
     } finally {
-      await run.voice?.stop()
+      try { await run.voice?.finish(finalStatus, failure?.message) } catch (error) {
+        run.log.record('voice.finish_failed', undefined, { error: String(error) })
+      }
       await this.stopScroller(run)
       await run.log.measure('frame_source.close', () => this.videoFrameSource.close())
       this.frameSourceMode = 'desktop-capturer'

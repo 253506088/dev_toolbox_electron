@@ -1,252 +1,273 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import type { CaptureTimingLog } from '../src/main/services/capture-timing-log'
-import type { VoiceConversionOptions } from '../src/main/services/wechat-voice-controller'
-import type { WechatVoicePreprocessorOptions, VoiceScanFrame } from '../src/main/services/wechat-voice-preprocessor'
-import type { WechatVoiceConversionStats } from '../src/shared/wechat-capture'
+import type { VoiceConversionOptions, VoiceConversionProgress } from '../src/main/services/wechat-voice-controller'
+import type { VoiceScanFrame } from '../src/main/services/wechat-voice-viewport'
 
 const dependencies = vi.hoisted(() => ({
-  start: vi.fn(),
-  validate: vi.fn(),
-  convertVisible: vi.fn(),
-  stop: vi.fn(),
-  scrollChatToTop: vi.fn(),
-  preprocessWechatVoices: vi.fn(),
-  writeFile: vi.fn()
+  start: vi.fn(), validate: vi.fn(), convertVisible: vi.fn(), stop: vi.fn(),
+  waitForStillFrame: vi.fn(), writeFile: vi.fn()
 }))
-
 vi.mock('node:fs/promises', () => ({ writeFile: dependencies.writeFile }))
-vi.mock('../src/main/services/wechat-voice-controller', () => ({
-  WechatVoiceController: { start: dependencies.start }
-}))
-vi.mock('../src/main/services/wechat-scroll-controller', () => ({ scrollChatToTop: dependencies.scrollChatToTop }))
-vi.mock('../src/main/services/wechat-voice-preprocessor', () => ({ preprocessWechatVoices: dependencies.preprocessWechatVoices }))
-
+vi.mock('../src/main/services/wechat-voice-controller', () => ({ WechatVoiceController: { start: dependencies.start } }))
+vi.mock('../src/main/services/wechat-scroll-controller', () => ({ waitForStillFrame: dependencies.waitForStillFrame }))
 import { WechatVoicePreparation } from '../src/main/services/wechat-voice-preparation'
 
-const zeroStats = (): WechatVoiceConversionStats => ({ scannedPages: 0, converted: 0, alreadyConverted: 0, failed: 0 })
-const frame: VoiceScanFrame = { fingerprint: new Uint8Array(4), width: 20, height: 20, fingerprintWidth: 2, fingerprintHeight: 2 }
-
-function setup() {
-  let cancelled = false
-  const log = {
-    measure: vi.fn(async (_event: string, action: () => Promise<unknown>) => action()),
-    record: vi.fn()
+const result = (converted = 0, alreadyConverted = 0, failed = 0): VoiceConversionProgress => ({
+  detected: converted + alreadyConverted + failed, converted, alreadyConverted, failed,
+  changed: converted > 0, warnings: []
+})
+function makeFrame(seed = 1): VoiceScanFrame {
+  const fingerprint = new Uint8Array(64 * 100).fill(245)
+  for (let row = 10; row < 16; row += 1) {
+    for (let column = 0; column < 64; column += 1) fingerprint[row * 64 + column] = (row * 31 + column * 73 + seed * 59) % 256
   }
+  return { fingerprint, width: 640, height: 1000, fingerprintWidth: 64, fingerprintHeight: 100 }
+}
+function setup(frame = makeFrame()) {
+  let cancelled = false
+  const log = { measure: vi.fn(async (_event: string, action: () => Promise<unknown>) => action()), record: vi.fn() }
   const options = {
-    sourceId: 'window:123:0',
-    crop: { left: 30, top: 10, right: 2, bottom: 20 },
-    outputDirectory: 'D:/capture-output',
-    capture: vi.fn(async () => frame),
-    scroll: vi.fn(async () => undefined),
-    isCancelled: () => cancelled,
-    onProgress: vi.fn(),
+    sourceId: 'window:123:0', crop: { left: 30, top: 10, right: 2, bottom: 20 },
+    outputDirectory: 'D:/capture-output', capture: vi.fn(async () => frame),
+    scroll: vi.fn(async (_notches: number) => undefined), isCancelled: () => cancelled, onProgress: vi.fn(),
     log: log as unknown as CaptureTimingLog
   }
-  return { preparation: new WechatVoicePreparation(options), options, log, cancel: () => { cancelled = true } }
+  return { frame, preparation: new WechatVoicePreparation(options), options, log, cancel: () => { cancelled = true } }
 }
-
 function report(): Record<string, unknown> {
   const call = dependencies.writeFile.mock.calls.at(-1)
   expect(call?.[0]).toMatch(/voice-conversion-report\.json$/)
   expect(call?.[2]).toBe('utf8')
   return JSON.parse(String(call?.[1]))
 }
-
+const candidate = { text: '3″', x: 100, y: 500, width: 80, height: 100, seconds: 3, source: 'ocr' as const }
+const viewport = { x: 0, y: 0, width: 640, height: 1000 }
 beforeEach(() => {
   vi.resetAllMocks()
   dependencies.start.mockReturnValue({ validate: dependencies.validate, convertVisible: dependencies.convertVisible, stop: dependencies.stop })
   dependencies.validate.mockResolvedValue(undefined)
+  dependencies.convertVisible.mockResolvedValue(result())
   dependencies.stop.mockResolvedValue(undefined)
   dependencies.writeFile.mockResolvedValue(undefined)
-  dependencies.scrollChatToTop.mockResolvedValue(frame)
-  dependencies.preprocessWechatVoices.mockResolvedValue({ ...zeroStats(), scannedPages: 1 })
+  dependencies.waitForStillFrame.mockImplementation(async (capture: () => Promise<VoiceScanFrame>) => ({ frame: await capture(), still: true, samples: 2 }))
 })
 
-describe('微信语音预处理与采集衔接', () => {
-  it('验证原生目标成功后才允许定位和扫描', async () => {
+describe('微信语音按当前截图视口处理', () => {
+  it('先验证目标，再只检查当前屏；无语音时不滚动、不提前结束控制器', async () => {
     let finishValidation!: () => void
     dependencies.validate.mockReturnValue(new Promise<void>((resolve) => { finishValidation = resolve }))
-    const { preparation } = setup()
-    const pending = preparation.prepare()
-    expect(dependencies.start).toHaveBeenCalledTimes(1)
-    expect(dependencies.scrollChatToTop).not.toHaveBeenCalled()
-    expect(dependencies.preprocessWechatVoices).not.toHaveBeenCalled()
+    const { preparation, options, frame } = setup()
+    const pending = preparation.prepare(frame)
+    expect(dependencies.start).toHaveBeenCalledOnce()
+    expect(dependencies.convertVisible).not.toHaveBeenCalled()
     finishValidation()
-    expect(await pending).toEqual({ ...zeroStats(), scannedPages: 1 })
-    expect(dependencies.scrollChatToTop).toHaveBeenCalledTimes(1)
-    expect(dependencies.preprocessWechatVoices).toHaveBeenCalledTimes(1)
-    expect(dependencies.stop).toHaveBeenCalledTimes(1)
-    expect(report()).toMatchObject({ status: 'complete', passes: 1, scannedPages: 1 })
+    expect(await pending).toBe(frame)
+    expect(options.scroll).not.toHaveBeenCalled()
+    expect(dependencies.convertVisible).toHaveBeenCalledOnce()
+    expect(dependencies.stop).not.toHaveBeenCalled()
+    await preparation.finish('complete')
+    expect(dependencies.stop).toHaveBeenCalledOnce()
+    expect(report()).toMatchObject({ mode: 'per-viewport', status: 'complete', scannedPages: 1, converted: 0 })
+    expect(report()).not.toHaveProperty('passes')
   })
-
-  it('发生转写后回顶再检查，直到完整一轮没有新增转写', async () => {
-    const passes = [
-      { scannedPages: 3, converted: 2, alreadyConverted: 1, failed: 0 },
-      { scannedPages: 4, converted: 1, alreadyConverted: 4, failed: 0 },
-      { scannedPages: 4, converted: 0, alreadyConverted: 6, failed: 0 }
-    ]
-    const order: string[] = []
-    dependencies.scrollChatToTop.mockImplementation(async () => { order.push('top'); return frame })
-    dependencies.preprocessWechatVoices.mockImplementation(async (options: WechatVoicePreprocessorOptions<VoiceScanFrame>) => {
-      order.push('scan')
-      const result = passes.shift()!
-      options.onProgress?.(result)
-      return result
-    })
-    const { preparation } = setup()
-    expect(await preparation.prepare()).toEqual({ scannedPages: 11, converted: 3, alreadyConverted: 11, failed: 0 })
-    expect(order).toEqual(['top', 'scan', 'top', 'scan', 'top', 'scan'])
-    expect(report()).toMatchObject({ status: 'complete', passes: 3, scannedPages: 11, converted: 3 })
-    expect(dependencies.validate).toHaveBeenCalledTimes(1)
-    expect(dependencies.stop).toHaveBeenCalledTimes(1)
+  it('连续底部静止帧跳过重复扫描，新画面复用同一控制器', async () => {
+    const { preparation, options, frame } = setup()
+    await preparation.prepare(frame)
+    await preparation.prepare({ ...frame, fingerprint: frame.fingerprint.slice() })
+    const next = makeFrame(2)
+    options.capture.mockResolvedValue(next)
+    await preparation.prepare(next)
+    expect(dependencies.start).toHaveBeenCalledOnce()
+    expect(dependencies.validate).toHaveBeenCalledOnce()
+    expect(dependencies.convertVisible).toHaveBeenCalledTimes(2)
+    await preparation.finish('complete')
+    expect(report()).toMatchObject({ scannedPages: 2 })
   })
-
-  it('本屏连续进度及整轮回执不会重复累加成功数量', async () => {
+  it('本屏增量进度与最终回执只累计一次，跨屏数量连续', async () => {
     dependencies.convertVisible.mockImplementation(async (options: VoiceConversionOptions) => {
-      const base = { detected: 2, alreadyConverted: 0, failed: 0, changed: true, warnings: [] }
-      options.onProgress?.({ ...base, converted: 1 })
-      options.onProgress?.({ ...base, converted: 2 })
-      return { ...base, converted: 2 }
+      options.onProgress?.(result(1, 1))
+      options.onProgress?.(result(2, 1))
+      return result(2, 1)
     })
-    dependencies.preprocessWechatVoices
-      .mockImplementationOnce(async (options: WechatVoicePreprocessorOptions<VoiceScanFrame>) => {
-        await options.convertVisible()
-        options.onProgress?.({ scannedPages: 1, converted: 2, alreadyConverted: 0, failed: 0 })
-        await options.convertVisible()
-        const result = { scannedPages: 2, converted: 4, alreadyConverted: 0, failed: 0 }
-        options.onProgress?.(result)
-        return result
-      })
-      .mockImplementationOnce(async (options: WechatVoicePreprocessorOptions<VoiceScanFrame>) => {
-        const result = { scannedPages: 3, converted: 0, alreadyConverted: 4, failed: 0 }
-        options.onProgress?.(result)
-        return result
-      })
-    const { preparation, options } = setup()
-    expect(await preparation.prepare()).toEqual({ scannedPages: 5, converted: 4, alreadyConverted: 4, failed: 0 })
-    const nativeProgress = options.onProgress.mock.calls.filter(([message]) => String(message).startsWith('正在展开语音文字'))
-    expect(nativeProgress.map(([, stats]) => stats.converted)).toEqual([1, 2, 3, 4])
-    expect(report()).toMatchObject({ converted: 4, passes: 2 })
+    const { preparation, options, frame } = setup()
+    await preparation.prepare(frame)
+    const next = makeFrame(2)
+    options.capture.mockResolvedValue(next)
+    await preparation.prepare(next)
+    await preparation.finish('complete')
+    expect(report()).toMatchObject({ scannedPages: 2, converted: 4, alreadyConverted: 2, failed: 0 })
+    const updates = options.onProgress.mock.calls.filter(([message]) => String(message).startsWith('正在处理本屏语音'))
+    expect(updates.map(([, stats]) => stats.converted)).toEqual([1, 2, 3, 4])
   })
-
-  it('本屏中途失败时保留之前轮次与本屏已有的成功及失败进度', async () => {
-    dependencies.preprocessWechatVoices
-      .mockResolvedValueOnce({ scannedPages: 2, converted: 3, alreadyConverted: 1, failed: 0 })
-      .mockImplementationOnce(async (options: WechatVoicePreprocessorOptions<VoiceScanFrame>) => {
-        options.onProgress?.({ scannedPages: 1, converted: 2, alreadyConverted: 1, failed: 0 })
-        await options.convertVisible()
-        throw new Error('unexpected success')
-      })
+  it('转写中途失败保留之前成功数量，结束时清理并报告原始错误', async () => {
     dependencies.convertVisible.mockImplementation(async (options: VoiceConversionOptions) => {
-      options.onProgress?.({ detected: 2, converted: 1, alreadyConverted: 0, failed: 1, changed: true, warnings: [] })
+      options.onProgress?.(result(1, 0, 1))
       throw new Error('微信转写超时')
     })
-    const { preparation, log } = setup()
-    await expect(preparation.prepare()).rejects.toThrow('微信转写超时')
-    expect(report()).toMatchObject({ status: 'error', passes: 2, scannedPages: 3, converted: 6, alreadyConverted: 2, failed: 1, error: '微信转写超时' })
-    expect(dependencies.stop).toHaveBeenCalledTimes(1)
-    expect(log.record).toHaveBeenCalledWith('voice.finished', undefined, expect.objectContaining({ status: 'error', converted: 6, failed: 1 }))
+    const { preparation, frame } = setup()
+    await expect(preparation.prepare(frame)).rejects.toThrow('微信转写超时')
+    await preparation.finish('error', '微信转写超时')
+    expect(dependencies.stop).toHaveBeenCalledOnce()
+    expect(report()).toMatchObject({ status: 'error', scannedPages: 1, converted: 1, failed: 1, error: '微信转写超时' })
   })
-
-  it('验证失败时不滚动聊天且清理原生进程并写报告', async () => {
-    dependencies.validate.mockRejectedValue(new Error('不是微信窗口'))
-    const { preparation } = setup()
-    await expect(preparation.prepare()).rejects.toThrow('不是微信窗口')
-    expect(dependencies.scrollChatToTop).not.toHaveBeenCalled()
-    expect(dependencies.preprocessWechatVoices).not.toHaveBeenCalled()
-    expect(dependencies.stop).toHaveBeenCalledTimes(1)
-    expect(report()).toMatchObject({ status: 'error', passes: 0, error: '不是微信窗口' })
+  it('返回未确认转换或无效统计时不交付截图帧', async () => {
+    dependencies.convertVisible.mockResolvedValueOnce(result(0, 0, 1))
+    const first = setup()
+    await expect(first.preparation.prepare(first.frame)).rejects.toThrow('未确认转写完成')
+    dependencies.convertVisible.mockResolvedValueOnce(result(-1))
+    const second = setup()
+    await expect(second.preparation.prepare(second.frame)).rejects.toThrow('无效统计')
   })
-
-  it('尚未启动即取消时不创建进程但记录停止结果', async () => {
-    const { preparation, cancel } = setup()
+  it('尚未开始即取消时不创建控制器，可写停止报告', async () => {
+    const { preparation, frame, cancel } = setup()
     cancel()
-    expect(await preparation.prepare()).toBeNull()
+    expect(await preparation.prepare(frame)).toBeNull()
+    await preparation.finish('stopped')
     expect(dependencies.start).not.toHaveBeenCalled()
-    expect(dependencies.scrollChatToTop).not.toHaveBeenCalled()
-    expect(report()).toMatchObject({ status: 'stopped', passes: 0 })
+    expect(report()).toMatchObject({ status: 'stopped', scannedPages: 0 })
   })
-
-  it('扫描返回时已取消则不启动下一轮，即使本轮转写了新语音', async () => {
-    const { preparation, cancel } = setup()
-    dependencies.preprocessWechatVoices.mockImplementation(async (options: WechatVoicePreprocessorOptions<VoiceScanFrame>) => {
-      const stats = { scannedPages: 1, converted: 1, alreadyConverted: 0, failed: 0 }
-      options.onProgress?.(stats)
-      cancel()
-      return stats
-    })
-    expect(await preparation.prepare()).toBeNull()
-    expect(dependencies.scrollChatToTop).toHaveBeenCalledTimes(1)
-    expect(dependencies.preprocessWechatVoices).toHaveBeenCalledTimes(1)
-    expect(report()).toMatchObject({ status: 'stopped', passes: 1, converted: 1 })
-    expect(dependencies.stop).toHaveBeenCalledTimes(1)
-  })
-
-  it('主动停止会关闭控制器并把取消期间的原生退出异常视为正常停止', async () => {
-    let rejectScan!: (reason: Error) => void
-    dependencies.preprocessWechatVoices.mockReturnValue(new Promise((_resolve, reject) => { rejectScan = reject }))
-    const { preparation } = setup()
-    const pending = preparation.prepare()
-    await vi.waitFor(() => expect(dependencies.preprocessWechatVoices).toHaveBeenCalledTimes(1))
+  it('停止中的原生退出被当作取消，取消后不采集准备结果', async () => {
+    let rejectScan!: (error: Error) => void
+    dependencies.convertVisible.mockReturnValue(new Promise((_resolve, reject) => { rejectScan = reject }))
+    const { preparation, frame } = setup()
+    const pending = preparation.prepare(frame)
+    await vi.waitFor(() => expect(dependencies.convertVisible).toHaveBeenCalledOnce())
     await preparation.stop()
     rejectScan(new Error('原生进程退出'))
     expect(await pending).toBeNull()
-    expect(dependencies.stop).toHaveBeenCalled()
-    expect(report()).toMatchObject({ status: 'stopped', passes: 1 })
-    expect(dependencies.scrollChatToTop).toHaveBeenCalledTimes(1)
+    await preparation.finish('stopped')
+    expect(report()).toMatchObject({ status: 'stopped', scannedPages: 1 })
   })
-
-  it('八轮仍有新增转写时明确失败并保存累计统计', async () => {
-    dependencies.preprocessWechatVoices.mockResolvedValue({ scannedPages: 2, converted: 1, alreadyConverted: 1, failed: 0 })
-    const { preparation } = setup()
-    await expect(preparation.prepare()).rejects.toThrow('多轮检查后仍有新增语音转写')
-    expect(dependencies.scrollChatToTop).toHaveBeenCalledTimes(8)
-    expect(dependencies.preprocessWechatVoices).toHaveBeenCalledTimes(8)
-    expect(dependencies.stop).toHaveBeenCalledTimes(1)
-    expect(report()).toMatchObject({ status: 'error', passes: 8, scannedPages: 16, converted: 8, alreadyConverted: 8 })
+  it('等待稳定超时或窗口尺寸改变时拒绝交付画面', async () => {
+    const first = setup()
+    dependencies.waitForStillFrame.mockResolvedValueOnce({ frame: first.frame, still: false, samples: 12 })
+    await expect(first.preparation.prepare(first.frame)).rejects.toThrow('画面仍在变化')
+    const second = setup()
+    dependencies.waitForStillFrame.mockResolvedValueOnce({ frame: { ...second.frame, width: 800 }, still: true, samples: 2 })
+    await expect(second.preparation.prepare(second.frame)).rejects.toThrow('尺寸发生变化')
   })
-
-  it('定位顶部失败时不扫描且照常结束控制器和写报告', async () => {
-    dependencies.scrollChatToTop.mockRejectedValue(new Error('无法确认顶部'))
-    const { preparation } = setup()
-    await expect(preparation.prepare()).rejects.toThrow('无法确认顶部')
-    expect(dependencies.preprocessWechatVoices).not.toHaveBeenCalled()
-    expect(dependencies.stop).toHaveBeenCalledTimes(1)
-    expect(report()).toMatchObject({ status: 'error', passes: 1, error: '无法确认顶部' })
+  it('已有已处理帧时也检查尺寸，不让相同指纹绕过窗口尺寸验证', async () => {
+    const { preparation, frame } = setup()
+    await preparation.prepare(frame)
+    await expect(preparation.prepare({ ...frame, width: 800 })).rejects.toThrow('尺寸发生变化')
   })
-
-  it('控制器启动失败仍记录故障，且不会尝试滚动', async () => {
-    dependencies.start.mockImplementation(() => { throw new Error('无法启动 PowerShell') })
-    const { preparation } = setup()
-    await expect(preparation.prepare()).rejects.toThrow('无法启动 PowerShell')
-    expect(dependencies.stop).not.toHaveBeenCalled()
-    expect(dependencies.scrollChatToTop).not.toHaveBeenCalled()
-    expect(report()).toMatchObject({ status: 'error', passes: 0, error: '无法启动 PowerShell' })
+  it('展开挤走顶部锚点时只回滚当前屏，找到原起点立即继续', async () => {
+    const { preparation, options, frame } = setup()
+    const moved = { ...frame, fingerprint: new Uint8Array(frame.fingerprint.length).fill(245) }
+    options.capture.mockResolvedValueOnce(frame).mockResolvedValueOnce(moved).mockResolvedValue(frame)
+    dependencies.convertVisible.mockImplementation(async (voiceOptions: VoiceConversionOptions) => {
+      await voiceOptions.beforeConvert?.(candidate, viewport)
+      await voiceOptions.restoreViewport?.()
+      return result(1)
+    })
+    expect(await preparation.prepare(frame)).toBe(frame)
+    expect(options.scroll.mock.calls).toEqual([[1]])
+    expect(options.onProgress.mock.calls.some(([message]) => String(message).includes('恢复本屏起点'))).toBe(true)
   })
-
-  it('控制器清理失败也尝试写报告并保留原始转写错误', async () => {
-    dependencies.preprocessWechatVoices.mockRejectedValue(new Error('原始转写失败'))
-    dependencies.stop.mockRejectedValue(new Error('临时目录被占用'))
-    const { preparation } = setup()
-    await expect(preparation.prepare()).rejects.toThrow('原始转写失败')
-    expect(report()).toMatchObject({ status: 'error', error: '原始转写失败' })
+  it('本屏锚点无法恢复时有严格回滚上限', async () => {
+    const { preparation, options, frame } = setup()
+    let reads = 0
+    options.capture.mockImplementation(async () => {
+      if (reads++ === 0) return frame
+      return { ...frame, fingerprint: new Uint8Array(frame.fingerprint.length).fill(reads % 2 ? 180 : 240) }
+    })
+    dependencies.convertVisible.mockImplementation(async (voiceOptions: VoiceConversionOptions) => {
+      await voiceOptions.beforeConvert?.(candidate, viewport)
+      await voiceOptions.restoreViewport?.()
+      return result(1)
+    })
+    await expect(preparation.prepare(frame)).rejects.toThrow('超出本屏恢复范围')
+    expect(options.scroll).toHaveBeenCalledTimes(40)
+    expect(options.scroll.mock.calls.every(([notches]) => notches === 1)).toBe(true)
   })
-
-  it('报告落盘失败仍清理进程并记录日志，不把失败结果当作可截图的成功', async () => {
+  it('每条转换返回相对位移，首屏裁切量保留相对原始视口的总位移', async () => {
+    const { preparation, options, frame } = setup()
+    const translated = (rows: number): VoiceScanFrame => {
+      const fingerprint = new Uint8Array(frame.fingerprint.length).fill(245)
+      fingerprint.set(frame.fingerprint.subarray(0, (100 - rows) * 64), rows * 64)
+      return { ...frame, fingerprint }
+    }
+    const shiftedTwice = translated(2)
+    const shiftedFive = translated(5)
+    options.capture.mockResolvedValueOnce(frame).mockResolvedValueOnce(shiftedTwice)
+      .mockResolvedValueOnce(shiftedTwice).mockResolvedValue(shiftedFive)
+    dependencies.convertVisible.mockImplementation(async (voiceOptions: VoiceConversionOptions) => {
+      await voiceOptions.beforeConvert?.(candidate, viewport)
+      expect(await voiceOptions.restoreViewport?.()).toBe(20)
+      await voiceOptions.beforeConvert?.({ ...candidate, y: 700 }, viewport)
+      expect(await voiceOptions.restoreViewport?.()).toBe(30)
+      return result(2)
+    })
+    expect(await preparation.prepare(frame)).toBe(shiftedFive)
+    expect(preparation.topInset).toBe(50)
+    expect(options.scroll).not.toHaveBeenCalled()
+  })
+  it('无法再滚动且锚点丢失时立即报错，不空转至上限', async () => {
+    const { preparation, options, frame } = setup()
+    const moved = { ...frame, fingerprint: new Uint8Array(frame.fingerprint.length).fill(245) }
+    options.capture.mockResolvedValueOnce(frame).mockResolvedValue(moved)
+    dependencies.convertVisible.mockImplementation(async (voiceOptions: VoiceConversionOptions) => {
+      await voiceOptions.beforeConvert?.(candidate, viewport)
+      await voiceOptions.restoreViewport?.()
+      return result(1)
+    })
+    await expect(preparation.prepare(frame)).rejects.toThrow('无法恢复本屏起点')
+    expect(options.scroll).toHaveBeenCalledOnce()
+  })
+  it('最后判稳期间起点被延迟动画挤出画面时拒绝交付，避免默认为零裁切丢失内容', async () => {
+    const { preparation, frame } = setup()
+    const moved = { ...frame, fingerprint: new Uint8Array(frame.fingerprint.length).fill(245) }
+    dependencies.convertVisible.mockImplementation(async (voiceOptions: VoiceConversionOptions) => {
+      await voiceOptions.beforeConvert?.(candidate, viewport)
+      return result(1)
+    })
+    dependencies.waitForStillFrame.mockResolvedValueOnce({ frame: moved, still: true, samples: 2 })
+    await expect(preparation.prepare(frame)).rejects.toThrow('本屏起点再次移动')
+  })
+  it('下一条语音前丢失初始锚点时拒绝沿用旧坐标继续处理', async () => {
+    const { preparation, options, frame } = setup()
+    const moved = { ...frame, fingerprint: new Uint8Array(frame.fingerprint.length).fill(245) }
+    options.capture.mockResolvedValueOnce(frame).mockResolvedValue(moved)
+    dependencies.convertVisible.mockImplementation(async (voiceOptions: VoiceConversionOptions) => {
+      await voiceOptions.beforeConvert?.(candidate, viewport)
+      await voiceOptions.beforeConvert?.({ ...candidate, y: 700 }, viewport)
+      return result(1)
+    })
+    await expect(preparation.prepare(frame)).rejects.toThrow('语音检查期间发生变化')
+  })
+  it('多次结束共享一次清理和报告写入', async () => {
+    const { preparation, frame } = setup()
+    await preparation.prepare(frame)
+    const first = preparation.finish('complete')
+    const second = preparation.finish('complete')
+    expect(first).toBe(second)
+    await first
+    expect(dependencies.stop).toHaveBeenCalledOnce()
+    expect(dependencies.writeFile).toHaveBeenCalledOnce()
+  })
+  it('验证失败时不滚动，结束报告包含原始原因', async () => {
+    dependencies.validate.mockRejectedValue(new Error('不是微信窗口'))
+    const { preparation, frame, options } = setup()
+    await expect(preparation.prepare(frame)).rejects.toThrow('不是微信窗口')
+    expect(dependencies.convertVisible).not.toHaveBeenCalled()
+    expect(options.scroll).not.toHaveBeenCalled()
+    await preparation.finish('error', '不是微信窗口')
+    expect(report()).toMatchObject({ status: 'error', scannedPages: 0, error: '不是微信窗口' })
+  })
+  it('原始转写失败不被清理或写报告失败覆盖', async () => {
+    const { preparation, frame, log } = setup()
+    dependencies.convertVisible.mockRejectedValue(new Error('原始转写失败'))
+    dependencies.stop.mockRejectedValue(new Error('控制器未退出'))
     dependencies.writeFile.mockRejectedValue(new Error('磁盘已满'))
-    const { preparation, log } = setup()
-    await expect(preparation.prepare()).rejects.toThrow('磁盘已满')
-    expect(dependencies.stop).toHaveBeenCalledTimes(1)
-    expect(log.record).toHaveBeenCalledWith('voice.report_failed', undefined, expect.objectContaining({ error: expect.stringContaining('磁盘已满') }))
-    expect(log.record).toHaveBeenCalledWith('voice.finished', undefined, expect.any(Object))
+    await expect(preparation.prepare(frame)).rejects.toThrow('原始转写失败')
+    await expect(preparation.finish('error', '原始转写失败')).resolves.toBeUndefined()
+    expect(log.record).toHaveBeenCalledWith('voice.finished', undefined, expect.objectContaining({ status: 'error', error: '原始转写失败' }))
   })
-
-  it('报告与转写同时失败时保留原始转写原因', async () => {
-    dependencies.preprocessWechatVoices.mockRejectedValue(new Error('微信转换失败'))
-    dependencies.writeFile.mockRejectedValue(new Error('磁盘已满'))
-    const { preparation, log } = setup()
-    await expect(preparation.prepare()).rejects.toThrow('微信转换失败')
-    expect(dependencies.stop).toHaveBeenCalledTimes(1)
-    expect(log.record).toHaveBeenCalledWith('voice.finished', undefined, expect.objectContaining({ status: 'error', error: '微信转换失败' }))
+  it('正常采集后的清理失败会标为错误并返回真实失败', async () => {
+    const { preparation, frame } = setup()
+    await preparation.prepare(frame)
+    dependencies.stop.mockRejectedValue(new Error('控制器未退出'))
+    await expect(preparation.finish('complete')).rejects.toThrow('控制器未退出')
+    expect(report()).toMatchObject({ status: 'error', error: '控制器未退出' })
   })
 })

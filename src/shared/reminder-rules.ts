@@ -1,5 +1,12 @@
 import type { NoteReminder } from './electron-api'
 
+/** 便签内容变化不应重置同一提醒的当日触发记录。 */
+export function hasSameReminderSchedule(previous: NoteReminder, current: NoteReminder): boolean {
+  return previous.type === current.type && previous.hour === current.hour && previous.minute === current.minute &&
+    previous.enabled === current.enabled && previous.onceDate === current.onceDate &&
+    previous.startDate === current.startDate && previous.endDate === current.endDate
+}
+
 /** 判断两个时间是否处于同一个本地自然日。 */
 export function isSameLocalDay(left: Date, right: Date): boolean {
   return (
@@ -34,5 +41,6 @@ export function shouldTriggerReminder(
   if (reminder.type === 'dateRange') {
     return isDateInRange(now, reminder.startDate, reminder.endDate)
   }
+  if (reminder.type === 'daily') return true
   return isWorkday
 }

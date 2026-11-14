@@ -10,7 +10,7 @@ import AppSettingsModal from './components/AppSettingsModal.vue'
 
 const themeStore = useThemeStore()
 const settingsStore = useSettingsStore()
-const activeToolId = ref(tools[0].id)
+const activeToolId = ref('notes')
 const settingsVisible = ref(false)
 const activeTool = computed(() => tools.find((tool) => tool.id === activeToolId.value) ?? tools[0])
 const toolGroups = groupTools()

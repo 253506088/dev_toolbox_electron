@@ -9,6 +9,7 @@ import { NoteService } from './note-service'
 export class ReminderScheduler {
   private alignTimer?: NodeJS.Timeout
   private minuteTimer?: NodeJS.Timeout
+  private pendingCheck?: Promise<void>
 
   /** 创建提醒调度器。 */
   constructor(
@@ -38,11 +39,36 @@ export class ReminderScheduler {
 
   /** 立即检查当前分钟应触发的提醒。 */
   async checkNow(): Promise<void> {
+    // 启动检查遇到慢速节假日请求时可能跨过整分钟，合并重叠的检查，
+    // 避免同一条提醒重复弹窗、抢焦点和置顶。
+    if (this.pendingCheck) return this.pendingCheck
+    this.pendingCheck = this.checkCurrentMinute()
+    try {
+      await this.pendingCheck
+    } finally {
+      this.pendingCheck = undefined
+    }
+  }
+
+  private async checkCurrentMinute(): Promise<void> {
+    let startedMinute: number
+    do {
+      startedMinute = Math.floor(Date.now() / 60_000)
+      await this.checkReminders()
+      // 慢请求跨分钟时补查此刻到期的便签，不能因合并检查漏掉新一分钟。
+    } while (startedMinute !== Math.floor(Date.now() / 60_000))
+  }
+
+  private async checkReminders(): Promise<void> {
     const now = new Date()
-    for (const note of this.notes.list()) {
-      if (!note.reminder?.enabled) continue
-      const workday = note.reminder.type === 'workday' ? await this.holidays.isWorkday(now) : false
-      if (shouldTriggerReminder(note.reminder, now, workday)) await this.trigger(note, now)
+    const dueNotes = this.notes.list().filter((note) => note.reminder && shouldTriggerReminder(note.reminder, now, true))
+    // 同一分钟的普通提醒立即展示，不被工作日查询拖住。工作日结果每轮只查一次。
+    for (const note of dueNotes.filter((item) => item.reminder!.type !== 'workday')) {
+      await this.triggerIfCurrent(note.id, now, false)
+    }
+    const workdayNotes = dueNotes.filter((note) => note.reminder!.type === 'workday')
+    if (workdayNotes.length > 0 && await this.holidays.isWorkday(now)) {
+      for (const note of workdayNotes) await this.triggerIfCurrent(note.id, now, true)
     }
     if (now.getDate() >= 25) {
       const nextMonth = new Date(now.getFullYear(), now.getMonth() + 1, 1)
@@ -50,7 +76,13 @@ export class ReminderScheduler {
     }
   }
 
-  /** 先记录触发状态，再执行声音、前台、置顶、抖动、系统通知和应用内弹窗。 */
+  /** 异步查询或其他提醒落盘期间，用户可能已关闭、修改或删除该提醒。 */
+  private async triggerIfCurrent(id: string, now: Date, workday: boolean): Promise<void> {
+    const note = this.notes.list().find((item) => item.id === id)
+    if (note?.reminder && shouldTriggerReminder(note.reminder, now, workday)) await this.trigger(note, now)
+  }
+
+  /** 先记录触发状态，再执行声音、前台、置顶、系统通知和应用内弹窗。 */
   private async trigger(note: StickyNote, now: Date): Promise<void> {
     const updated = await this.notes.markReminderTriggered(note.id, now.toISOString())
     if (!updated) return
@@ -66,7 +98,6 @@ export class ReminderScheduler {
       setTimeout(() => {
         if (!window.isDestroyed()) window.setAlwaysOnTop(false)
       }, 10_000)
-      void shakeWindow(window)
       window.webContents.send('notes:reminder', updated)
     }
     const notification = new Notification({
@@ -81,21 +112,4 @@ export class ReminderScheduler {
     })
     notification.show()
   }
-}
-
-/** 使用 Electron 窗口坐标实现短促横向抖动。 */
-async function shakeWindow(window: BrowserWindow): Promise<void> {
-  if (window.isDestroyed() || window.isMaximized() || window.isFullScreen()) return
-  const [originalX, originalY] = window.getPosition()
-  for (let index = 0; index < 8; index += 1) {
-    if (window.isDestroyed()) return
-    window.setPosition(originalX + (index % 2 === 0 ? 14 : -14), originalY)
-    await wait(45)
-  }
-  if (!window.isDestroyed()) window.setPosition(originalX, originalY)
-}
-
-/** 等待指定毫秒数，让窗口抖动保持可见节奏。 */
-function wait(milliseconds: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, milliseconds))
 }

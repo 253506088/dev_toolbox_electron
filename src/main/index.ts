@@ -55,6 +55,8 @@ function createWindow(): void {
   })
   mainWindow = window
   window.once('ready-to-show', () => window.show())
+  // 根组件挂载并订阅提醒之后再检查当前分钟，避免启动时的提醒 IPC 丢失。
+  window.webContents.once('did-finish-load', () => reminderScheduler?.start())
   window.on('closed', () => {
     if (mainWindow === window) mainWindow = null
   })
@@ -101,9 +103,8 @@ async function bootstrap(): Promise<void> {
   registerWechatExportIpc(wechatExport)
   registerNoteImageProtocol(notes)
   mediaSources.registerProtocol()
-  createWindow()
   reminderScheduler = new ReminderScheduler(notes, holidays, () => mainWindow)
-  reminderScheduler.start()
+  createWindow()
   console.info('开发者工具箱主进程已启动')
 }
 

@@ -1,5 +1,7 @@
 # 依赖及 Electron / Vite 构建、安装包产物，可通过 pnpm 重新生成。
 node_modules/
+# pnpm 在当前项目生成的本地包缓存，不属于源码或锁文件。
+.pnpm-store/
 out/
 dist/
 
@@ -8,10 +10,11 @@ dist/
 *.tsbuildinfo
 coverage/
 .vitest/
+# 包含发布启动检查的合成用户数据、截图和诊断结果，可由检查脚本重新生成。
 test-results/
 playwright-report/
 
-# 机器相关的编辑器、系统缓存及临时文件。
+# 机器相关的编辑器、系统缓存及临时文件（包括曾被跟踪的 IDE 工程配置）。
 /.idea/
 .DS_Store
 Thumbs.db
@@ -27,9 +30,8 @@ Thumbs.db
 # FFmpeg 下载产物，由 pnpm ffmpeg:prepare 准备，不将可执行文件入库。
 resources/ffmpeg/ffmpeg.exe
 
-# 私人设计文档与本地调试资料；公开开发指南保留在仓库根目录。
+# 私人设计文档与本地调试资料；根目录的开发指南与更新日志正常提交。
 /my_doc/*
-!/开发、调试与发布指南.md
 
 # 用户导出的聊天截图可能含私人信息，不提交默认命名的输出目录。
 /滚动长截图/

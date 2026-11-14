@@ -22,6 +22,10 @@ export interface VoiceConversionOptions {
   timeoutMs?: number
   isCancelled: () => boolean
   onProgress?: (progress: VoiceConversionProgress) => void
+  /** Runs before opening a candidate's menu, so callers can retain a clean viewport anchor. */
+  beforeConvert?: (candidate: VoiceCandidate, viewport: VoiceRect) => Promise<void>
+  /** Restores this screen and returns its net Y shift in logical pixels relative to beforeConvert. */
+  restoreViewport?: () => Promise<number | void>
 }
 
 interface VoiceSnapshot {
@@ -37,7 +41,8 @@ interface NativeReply { error?: string; code?: string; [key: string]: unknown }
 
 /**
  * A dedicated helper owns only the menus it opened. Native/UIA operations are bounded and
- * cancellable, and the helper is terminated before callers start moving the chat again.
+ * cancellable. The helper stays alive across capture screens, while each conversion closes
+ * its own menu before returning control to the capture loop.
  */
 export class WechatVoiceController {
   private output = ''
@@ -63,7 +68,9 @@ export class WechatVoiceController {
     try {
       // -File avoids Windows' command-line length limit; the BOM preserves Chinese on Windows PowerShell 5.1.
       writeFileSync(path, '\ufeff' + wechatVoiceScript(handle, crop), 'utf8')
-      const child = spawn('powershell.exe', ['-NoProfile', '-NonInteractive', '-OutputFormat', 'Text', '-File', path], { windowsHide: true })
+      // This is our own generated script. Set policy for this helper process only;
+      // Windows' default Restricted policy otherwise blocks every -File launch.
+      const child = spawn('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-OutputFormat', 'Text', '-File', path], { windowsHide: true })
       return new WechatVoiceController(child, directory, handle)
     } catch (error) {
       rmSync(directory, { recursive: true, force: true })
@@ -95,7 +102,7 @@ export class WechatVoiceController {
     child.once('exit', () => this.fail(new Error(this.stopped ? '语音处理已停止' : `语音控制器意外退出：${this.stderr.trim()}`)))
   }
 
-  /** Validate the target and recognition backend before the preparation pass moves the chat. */
+  /** Validate the target and recognition backend before the capture loop moves the chat. */
   async validate(options: Pick<VoiceConversionOptions, 'isCancelled'>): Promise<void> {
     await this.command({ command: 'validate' }, options)
   }
@@ -106,29 +113,24 @@ export class WechatVoiceController {
     const progress: VoiceConversionProgress = { detected: 0, converted: 0, alreadyConverted: 0, failed: 0, changed: false, warnings: [] }
     try {
       if (options.isCancelled()) return progress
-      let snapshot = await this.snapshot(options)
-      const initial = findVoiceCandidates(snapshot.elements, snapshot.words, snapshot.crop).reverse()
-      progress.detected = initial.length
-      if (!snapshot.ocrAvailable && snapshot.elements.length === 0) {
-        throw new Error('微信未暴露可访问性文字，且系统中文 OCR 不可用；请安装 Windows 中文 OCR 语言包后重试')
-      }
-      const visited = new Set<string>()
-      // Process from the top and reacquire geometry before each click. Never trust stale coordinates.
-      for (const initialCandidate of initial) {
+      const visited: VoiceCandidate[] = []
+      // Expansion changes the message list. Re-detect from the top of the current viewport
+      // after every operation, including messages that were not visible in its first snapshot.
+      for (let checked = 0; ; checked += 1) {
         if (options.isCancelled()) break
-        snapshot = await this.snapshot(options)
-        const candidates = findVoiceCandidates(snapshot.elements, snapshot.words, snapshot.crop)
-        const candidate = this.resolveCandidate(initialCandidate, candidates, visited)
-        if (!candidate) {
-          if (progress.converted > 0) {
-            // The preparation service must run another complete pass after any conversion.
-            progress.warnings.push('语音展开后部分消息离开视口，将在下一轮从顶部复查')
-            continue
-          }
-          throw new Error('待处理语音位置发生变化，已停止截图；请保持微信聊天静止后重试')
+        const snapshot = await this.snapshot(options)
+        if (!snapshot.ocrAvailable && snapshot.elements.length === 0) {
+          throw new Error('微信未暴露可访问性文字，且系统中文 OCR 不可用；请安装 Windows 中文 OCR 语言包后重试')
         }
-        const key = candidateKey(candidate)
-        visited.add(key)
+        const candidates = findVoiceCandidates(snapshot.elements, snapshot.words, snapshot.crop)
+          .sort((first, second) => first.y - second.y || first.x - second.x)
+        const candidate = candidates.find((item) => !visited.some((previous) => sameVisibleCandidate(previous, item)))
+        if (!candidate) break
+        if (checked >= 120) throw new Error('本屏语音位置持续变化，已停止截图；请保持微信聊天静止后重试')
+        progress.detected += 1
+        let viewportShift = 0
+        await options.beforeConvert?.(candidate, snapshot.crop)
+        if (options.isCancelled()) break
         this.menuOpen = true
         const menu = await this.command({ command: 'open', x: Math.round(candidate.x + candidate.width / 2), y: Math.round(candidate.y + candidate.height / 2) }, options)
         if (menu.action === 'expanded') {
@@ -142,12 +144,17 @@ export class WechatVoiceController {
           await this.waitForTranscript(snapshot, candidate, options)
           if (options.isCancelled()) break
           progress.converted += 1
+          viewportShift = await options.restoreViewport?.() ?? 0
+          if (!Number.isFinite(viewportShift)) throw new Error('语音视口返回了无效位移')
+          if (options.isCancelled()) break
         } else {
           await this.closeMenu(options)
           // A plain text such as 3" is harmless: no recognized voice menu means no click.
           if (candidate.source === 'accessibility') throw new Error('已识别语音，但没有找到“语音转文字”菜单，请确认微信版本与聊天区域')
           progress.warnings.push(`未确认 ${candidate.seconds} 秒候选项的语音菜单，已跳过`)
         }
+        if (viewportShift) for (const previous of visited) previous.y += viewportShift
+        visited.push({ ...candidate, y: candidate.y + viewportShift })
         options.onProgress?.({ ...progress, warnings: [...progress.warnings] })
       }
       return progress
@@ -165,18 +172,19 @@ export class WechatVoiceController {
     }
   }
 
-  private resolveCandidate(initial: VoiceCandidate, current: VoiceCandidate[], visited: Set<string>): VoiceCandidate | undefined {
-    if (initial.id) return current.find((item) => item.id === initial.id && !visited.has(candidateKey(item)))
-    return current.filter((item) => item.seconds === initial.seconds && !visited.has(candidateKey(item)))
-      .sort((a, b) => Math.abs(a.y - initial.y) - Math.abs(b.y - initial.y))[0]
-  }
-
   private async waitForTranscript(before: VoiceSnapshot, candidate: VoiceCandidate, options: VoiceConversionOptions): Promise<void> {
     const deadline = Date.now() + Math.min(120_000, Math.max(3000, options.timeoutMs ?? 30_000))
     let previousHash = ''
     let stableSince = 0
+    let lastMenuCheck = 0
     while (Date.now() < deadline) {
       await delay(350)
+      if (options.isCancelled()) return
+      // WeChat can pin the bottom of the history when a long transcript expands.
+      // Restore the local anchor before resolving OCR durations, otherwise a different
+      // bubble with the same duration could be mistaken for this voice.
+      const viewportShift = await options.restoreViewport?.() ?? 0
+      if (!Number.isFinite(viewportShift)) throw new Error('语音视口返回了无效位移')
       if (options.isCancelled()) return
       const current = await this.snapshot(options)
       const lines = mergeVoiceTextLines(current.words.length ? current.words : current.elements)
@@ -186,21 +194,26 @@ export class WechatVoiceController {
       const busy = lines.some((item) => isVoiceStatusText(item.text) && /正在|中/.test(item.text))
       const currentText = current.words.length ? current.words : current.elements
       const detected = findVoiceCandidates(current.elements, current.words, current.crop)
-      const anchor = (candidate.id ? detected.find((item) => item.id === candidate.id) : undefined) ??
-        detected.filter((item) => item.seconds === candidate.seconds).sort((a, b) => Math.abs(a.y - candidate.y) - Math.abs(b.y - candidate.y))[0]
+      const anchor = candidate.id
+        ? detected.find((item) => item.id === candidate.id)
+        : detected.find((item) => sameVisibleCandidate({ ...candidate, y: candidate.y + viewportShift }, item))
       const belowVoice = anchor && currentText.filter((item) => item.y >= anchor.y + anchor.height * 0.75 && item.y <= anchor.y + Math.min(current.crop.height * 0.6, 500))
       const added = !!belowVoice && hasNewTranscript(before.words.length ? before.words : before.elements, belowVoice)
-      if (!busy && belowVoice && hasNewTranscript([], belowVoice) && current.hash !== before.hash) {
+      if (!busy && anchor) {
         if (current.hash !== previousHash) stableSince = Date.now()
         else if (stableSince && Date.now() - stableSince >= 700) {
-          if (added) return
-          // The result may be an existing word such as 收到. Confirm the expanded state
-          // through the actual context menu instead of treating a mere layout shift as success.
-          this.menuOpen = true
-          const menu = await this.command({ command: 'open', x: Math.round(anchor!.x + anchor!.width / 2), y: Math.round(anchor!.y + anchor!.height / 2) }, options)
-          await this.closeMenu(options)
-          if (menu.action === 'expanded') return
-          stableSince = 0
+          if (added && current.hash !== before.hash) return
+          // A bottom-edge voice can expand entirely below the selected crop. Its pixels
+          // need not change, and a repeated transcript may add no new OCR words. The
+          // actual collapse-text menu confirms completion in both cases without moving
+          // away from the screenshot's starting point or selecting the menu again.
+          if (Date.now() - lastMenuCheck >= 1000) {
+            lastMenuCheck = Date.now()
+            this.menuOpen = true
+            const menu = await this.command({ command: 'open', x: Math.round(anchor.x + anchor.width / 2), y: Math.round(anchor.y + anchor.height / 2) }, options)
+            await this.closeMenu(options)
+            if (menu.action === 'expanded') return
+          }
         }
         previousHash = current.hash
       } else {
@@ -343,8 +356,11 @@ export class WechatVoiceController {
   }
 }
 
-function candidateKey(candidate: VoiceCandidate): string {
-  return candidate.id || `${candidate.seconds}:${Math.round(candidate.x / 8)}:${Math.round(candidate.y / 8)}`
+function sameVisibleCandidate(first: VoiceCandidate, second: VoiceCandidate): boolean {
+  if (first.id && second.id) return first.id === second.id
+  return first.seconds === second.seconds &&
+    Math.abs(first.x - second.x) <= Math.max(8, Math.min(first.width, second.width) * 0.3) &&
+    Math.abs(first.y - second.y) <= Math.max(6, Math.min(first.height, second.height) * 0.6)
 }
 
 function trimBubbleHorizontalPadding(rgb: Uint8Array, imageWidth: number, region: VoiceRect): VoiceRect {
