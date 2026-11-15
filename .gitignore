@@ -10,7 +10,8 @@ dist/
 *.tsbuildinfo
 coverage/
 .vitest/
-# 包含发布启动检查的合成用户数据、截图和诊断结果，可由检查脚本重新生成。
+# 发布首屏、Windows 原生语音及多显示器抓帧检查的合成用户数据、截图与诊断。
+# 这些数据可由测试脚本重建，可能含机器路径或屏幕内容；只提交脚本，不提交运行结果。
 test-results/
 playwright-report/
 
