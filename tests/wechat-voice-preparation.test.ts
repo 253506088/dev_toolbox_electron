@@ -63,6 +63,7 @@ describe('微信语音按当前截图视口处理', () => {
     finishValidation()
     expect(await pending).toBe(frame)
     expect(options.scroll).not.toHaveBeenCalled()
+    expect(dependencies.waitForStillFrame).not.toHaveBeenCalled()
     expect(dependencies.convertVisible).toHaveBeenCalledOnce()
     expect(dependencies.stop).not.toHaveBeenCalled()
     await preparation.finish('complete')
@@ -139,6 +140,7 @@ describe('微信语音按当前截图视口处理', () => {
     expect(report()).toMatchObject({ status: 'stopped', scannedPages: 1 })
   })
   it('等待稳定超时或窗口尺寸改变时拒绝交付画面', async () => {
+    dependencies.convertVisible.mockResolvedValue(result(1))
     const first = setup()
     dependencies.waitForStillFrame.mockResolvedValueOnce({ frame: first.frame, still: false, samples: 12 })
     await expect(first.preparation.prepare(first.frame)).rejects.toThrow('画面仍在变化')

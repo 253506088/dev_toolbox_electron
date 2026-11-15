@@ -20,6 +20,8 @@ export interface VoiceConversionProgress {
 
 export interface VoiceConversionOptions {
   timeoutMs?: number
+  /** A caller-verified unchanged overlap; never infer identity from a duration or recycled UIA id alone. */
+  previousViewportShiftRatio?: number
   isCancelled: () => boolean
   onProgress?: (progress: VoiceConversionProgress) => void
   /** Runs before opening a candidate's menu, so callers can retain a clean viewport anchor. */
@@ -55,6 +57,7 @@ export class WechatVoiceController {
   private stopPromise: Promise<void> | null = null
   private ocrImageSequence = 0
   private durationCache: { key: string; words: VoiceText[] } | null = null
+  private completedViewport: { crop: VoiceRect; candidates: VoiceCandidate[] } | null = null
 
   static start(sourceId: string, crop: WechatCaptureCrop): WechatVoiceController {
     if (process.platform !== 'win32') throw new Error('微信语音转文字目前仅支持 Windows')
@@ -113,18 +116,28 @@ export class WechatVoiceController {
     const progress: VoiceConversionProgress = { detected: 0, converted: 0, alreadyConverted: 0, failed: 0, changed: false, warnings: [] }
     try {
       if (options.isCancelled()) return progress
-      const visited: VoiceCandidate[] = []
-      // Expansion changes the message list. Re-detect from the top of the current viewport
-      // after every operation, including messages that were not visible in its first snapshot.
+      let snapshot = await this.snapshot(options)
+      const shift = options.previousViewportShiftRatio
+      const reusable = this.completedViewport && shift !== undefined && Number.isFinite(shift) && shift < 0 && shift >= -0.6 &&
+        this.completedViewport.crop.width === snapshot.crop.width && this.completedViewport.crop.height === snapshot.crop.height
+        ? this.completedViewport.candidates.map((item) => ({ ...item,
+            x: item.x + snapshot.crop.x - this.completedViewport!.crop.x,
+            y: item.y + snapshot.crop.y - this.completedViewport!.crop.y + shift * snapshot.crop.height
+          })).filter((item) => item.y >= snapshot.crop.y + 2 && item.y + item.height <= snapshot.crop.y + snapshot.crop.height - 2)
+        : []
+      const visited: VoiceCandidate[] = reusable.map((item) => ({ ...item }))
+      const completed: VoiceCandidate[] = reusable.map((item) => ({ ...item }))
+      this.completedViewport = null
+      // Inspect all candidates from one snapshot. Only an actual expansion changes the
+      // message list and requires OCR again; checking an expanded voice does not.
       for (let checked = 0; ; checked += 1) {
         if (options.isCancelled()) break
-        const snapshot = await this.snapshot(options)
         if (!snapshot.ocrAvailable && snapshot.elements.length === 0) {
           throw new Error('微信未暴露可访问性文字，且系统中文 OCR 不可用；请安装 Windows 中文 OCR 语言包后重试')
         }
         const candidates = findVoiceCandidates(snapshot.elements, snapshot.words, snapshot.crop)
           .sort((first, second) => first.y - second.y || first.x - second.x)
-        const candidate = candidates.find((item) => !visited.some((previous) => sameVisibleCandidate(previous, item)))
+        const candidate = candidates.find((item) => !visited.some((previous) => sameVisibleCandidate(previous, item, true)))
         if (!candidate) break
         if (checked >= 120) throw new Error('本屏语音位置持续变化，已停止截图；请保持微信聊天静止后重试')
         progress.detected += 1
@@ -136,6 +149,7 @@ export class WechatVoiceController {
         if (menu.action === 'expanded') {
           progress.alreadyConverted += 1
           await this.closeMenu(options)
+          completed.push({ ...candidate })
         } else if (menu.action === 'transcribe') {
           // Native code rechecks the exact label in the still-open popup before clicking.
           await this.command({ command: 'select' }, options)
@@ -143,6 +157,7 @@ export class WechatVoiceController {
           progress.changed = true
           await this.waitForTranscript(snapshot, candidate, options)
           if (options.isCancelled()) break
+          completed.push({ ...candidate })
           progress.converted += 1
           viewportShift = await options.restoreViewport?.() ?? 0
           if (!Number.isFinite(viewportShift)) throw new Error('语音视口返回了无效位移')
@@ -153,10 +168,15 @@ export class WechatVoiceController {
           if (candidate.source === 'accessibility') throw new Error('已识别语音，但没有找到“语音转文字”菜单，请确认微信版本与聊天区域')
           progress.warnings.push(`未确认 ${candidate.seconds} 秒候选项的语音菜单，已跳过`)
         }
-        if (viewportShift) for (const previous of visited) previous.y += viewportShift
+        if (viewportShift) {
+          for (const previous of visited) previous.y += viewportShift
+          for (const previous of completed) previous.y += viewportShift
+        }
         visited.push({ ...candidate, y: candidate.y + viewportShift })
         options.onProgress?.({ ...progress, warnings: [...progress.warnings] })
+        if (menu.action === 'transcribe') snapshot = await this.snapshot(options)
       }
+      if (!options.isCancelled()) this.completedViewport = { crop: { ...snapshot.crop }, candidates: completed }
       return progress
     } catch (error) {
       if (options.isCancelled()) return progress
@@ -356,8 +376,9 @@ export class WechatVoiceController {
   }
 }
 
-function sameVisibleCandidate(first: VoiceCandidate, second: VoiceCandidate): boolean {
-  if (first.id && second.id) return first.id === second.id
+function sameVisibleCandidate(first: VoiceCandidate, second: VoiceCandidate, requirePosition = false): boolean {
+  if (first.id && second.id && first.id !== second.id) return false
+  if (!requirePosition && first.id && second.id) return first.id === second.id
   return first.seconds === second.seconds &&
     Math.abs(first.x - second.x) <= Math.max(8, Math.min(first.width, second.width) * 0.3) &&
     Math.abs(first.y - second.y) <= Math.max(6, Math.min(first.height, second.height) * 0.6)

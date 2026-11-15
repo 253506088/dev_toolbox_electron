@@ -26,12 +26,16 @@ public static class VoiceNative {
   [StructLayout(LayoutKind.Sequential)] public struct POINT { public int X, Y; }
   public delegate bool EnumWindowProc(IntPtr hwnd, IntPtr lparam);
   [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r);
+  [DllImport("dwmapi.dll")] static extern int DwmGetWindowAttribute(IntPtr h, int attribute, out RECT r, int size);
   [DllImport("user32.dll")] public static extern bool IsWindow(IntPtr h);
   [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr h);
   [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);
   [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
   [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
   [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
+  [DllImport("user32.dll")] static extern bool AttachThreadInput(uint source, uint target, bool attach);
+  [DllImport("user32.dll")] static extern bool BringWindowToTop(IntPtr h);
+  [DllImport("kernel32.dll")] static extern uint GetCurrentThreadId();
   [DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y);
   [DllImport("user32.dll")] public static extern bool GetCursorPos(out POINT p);
   [DllImport("user32.dll")] public static extern IntPtr WindowFromPoint(POINT p);
@@ -42,7 +46,20 @@ public static class VoiceNative {
   [DllImport("user32.dll")] static extern bool EnumWindows(EnumWindowProc callback, IntPtr param);
   [DllImport("user32.dll")] static extern IntPtr SetThreadDpiAwarenessContext(IntPtr context);
   public static void EnableDpi() { try { SetThreadDpiAwarenessContext(new IntPtr(-4)); } catch (EntryPointNotFoundException) {} }
+  public static bool GetVisibleRect(IntPtr h, out RECT r) {
+    if (DwmGetWindowAttribute(h, 9, out r, Marshal.SizeOf(typeof(RECT))) == 0 && r.Right > r.Left && r.Bottom > r.Top) return true;
+    return GetWindowRect(h, out r);
+  }
   public static uint ProcessId(IntPtr h) { uint id; GetWindowThreadProcessId(h, out id); return id; }
+  public static void Activate(IntPtr h) {
+    if (GetForegroundWindow() == h || SetForegroundWindow(h)) return;
+    uint process;
+    uint foregroundThread = GetWindowThreadProcessId(GetForegroundWindow(), out process);
+    uint currentThread = GetCurrentThreadId();
+    if (foregroundThread == 0 || foregroundThread == currentThread || !AttachThreadInput(currentThread, foregroundThread, true)) return;
+    try { BringWindowToTop(h); SetForegroundWindow(h); }
+    finally { AttachThreadInput(currentThread, foregroundThread, false); }
+  }
   public static long[] Windows(uint process) {
     var result = new List<long>();
     EnumWindows(delegate(IntPtr h, IntPtr p) { if (IsWindowVisible(h) && ProcessId(h) == process) result.Add(h.ToInt64()); return true; }, IntPtr.Zero);
@@ -92,7 +109,7 @@ function Await-Voice($operation, $resultType) {
 
 function Get-Rect([IntPtr]$window) {
   $r = New-Object VoiceNative+RECT
-  if (-not [VoiceNative]::GetWindowRect($window, [ref]$r)) { throw '无法读取微信窗口位置' }
+  if (-not [VoiceNative]::GetVisibleRect($window, [ref]$r)) { throw '无法读取微信窗口位置' }
   return @{ x = $r.Left; y = $r.Top; width = $r.Right - $r.Left; height = $r.Bottom - $r.Top }
 }
 
@@ -105,7 +122,7 @@ function Assert-Window {
   if ($processName -notmatch '^(WeChat|Weixin|WeChatAppEx)$') { throw '语音转文字只能用于微信窗口' }
   $foreground = [VoiceNative]::GetForegroundWindow()
   if ([VoiceNative]::ProcessId($foreground) -ne $targetProcess) {
-    [VoiceNative]::SetForegroundWindow($targetHandle) | Out-Null
+    [VoiceNative]::Activate($targetHandle)
     Start-Sleep -Milliseconds 150
   }
   if ([VoiceNative]::ProcessId([VoiceNative]::GetForegroundWindow()) -ne $targetProcess) { throw '无法将微信窗口置于前台，请手动切换至微信后重试' }

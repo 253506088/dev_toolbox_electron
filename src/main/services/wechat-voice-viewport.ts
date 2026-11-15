@@ -1,3 +1,5 @@
+import { findVerticalOverlap } from '../../shared/wechat-capture'
+
 export interface VoiceScanFrame {
   fingerprint: Uint8Array
   width: number
@@ -7,6 +9,40 @@ export interface VoiceScanFrame {
 }
 
 export interface VoiceViewportAnchor { pixels: Uint8Array; width: number; height: number; row: number }
+
+/** Only reuse inspected voices when the complete overlapping image proves the same content moved up. */
+export function reusableVoiceViewportShift(previous: VoiceScanFrame, current: VoiceScanFrame): number | undefined {
+  const width = previous.fingerprintWidth
+  const height = previous.fingerprintHeight
+  if (width !== current.fingerprintWidth || height !== current.fingerprintHeight ||
+    previous.width !== current.width || previous.height !== current.height) return undefined
+  const match = findVerticalOverlap(previous.fingerprint, current.fingerprint, width, height, 0.4, 0.995)
+  if (match.score > 0.004 || match.overlap < 8) return undefined
+  // Repeated identical bubbles or blank backgrounds cannot establish message identity.
+  const alternatives = [
+    match.overlap > height * 0.4 + 2
+      ? findVerticalOverlap(previous.fingerprint, current.fingerprint, width, height, 0.4, (match.overlap - 2) / height).score : 1,
+    match.overlap < height - 3
+      ? findVerticalOverlap(previous.fingerprint, current.fingerprint, width, height, (match.overlap + 2) / height, 0.995).score : 1
+  ]
+  if (Math.min(...alternatives) < match.score + 0.008) return undefined
+  let texturedRows = 0
+  for (let row = 0; row < match.overlap; row += 1) {
+    let difference = 0
+    let texture = 0
+    const before = (height - match.overlap + row) * width
+    const after = row * width
+    for (let x = 0; x < width; x += 1) {
+      difference += Math.abs(previous.fingerprint[before + x] - current.fingerprint[after + x])
+      if (x > 0) texture += Math.abs(current.fingerprint[after + x] - current.fingerprint[after + x - 1])
+    }
+    // A transcript being collapsed or edited invalidates the cache even if the rest of
+    // a mostly blank chat still has an excellent global overlap score.
+    if (difference / (width * 255) > 0.015) return undefined
+    if (texture / width > 4) texturedRows += 1
+  }
+  return texturedRows >= 6 ? -(height - match.overlap) / height : undefined
+}
 
 /** 选取首条语音之前最有辨识度的小段像素，不依赖聊天文本或消息 ID。 */
 export function createVoiceViewportAnchor(frame: VoiceScanFrame, beforeRatio: number): VoiceViewportAnchor | null {

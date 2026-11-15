@@ -3,7 +3,7 @@ import { join } from 'node:path'
 import { normalizedImageDifference, type WechatCaptureCrop, type WechatVoiceConversionStats } from '../../shared/wechat-capture'
 import { waitForStillFrame } from './wechat-scroll-controller'
 import { WechatVoiceController } from './wechat-voice-controller'
-import { createVoiceViewportAnchor, locateVoiceViewportAnchor, type VoiceViewportAnchor, type VoiceScanFrame } from './wechat-voice-viewport'
+import { createVoiceViewportAnchor, locateVoiceViewportAnchor, reusableVoiceViewportShift, type VoiceViewportAnchor, type VoiceScanFrame } from './wechat-voice-viewport'
 import type { CaptureTimingLog } from './capture-timing-log'
 
 interface VoicePreparationOptions<T extends VoiceScanFrame> {
@@ -52,6 +52,7 @@ export class WechatVoicePreparation<T extends VoiceScanFrame> {
       publish(`正在检查第 ${this.stats.scannedPages} 屏语音，处理完成后立即截图…`)
       const result = await options.log.measure('voice.prepare_viewport', () => this.controller!.convertVisible({
         isCancelled: () => this.isCancelled(),
+        previousViewportShiftRatio: this.lastPrepared ? reusableVoiceViewportShift(this.lastPrepared, frame) : undefined,
         beforeConvert: async (candidate, viewport) => {
           if (this.isCancelled()) return
           const clean = await options.capture()
@@ -100,7 +101,12 @@ export class WechatVoicePreparation<T extends VoiceScanFrame> {
       this.stats = { scannedPages: baseline.scannedPages, converted: baseline.converted + result.converted,
         alreadyConverted: baseline.alreadyConverted + result.alreadyConverted, failed: baseline.failed + result.failed }
       if (result.failed > 0) throw new Error(`本屏有 ${result.failed} 条语音未确认转写完成，已停止并保留已截图内容`)
-      const prepared = await this.settle(frame)
+      // A scan that opened no menu can immediately hand back an unchanged frame.
+      // Still re-capture once: the OCR scan itself can take time and new messages may arrive.
+      const inspected = result.detected === 0 ? await options.capture() : null
+      if (inspected) this.assertDimensions(frame, inspected)
+      const prepared = inspected && normalizedImageDifference(frame.fingerprint, inspected.fingerprint) < 0.0001
+        ? inspected : await this.settle(frame)
       if (this.isCancelled()) return null
       const finalAnchor = anchor as VoiceViewportAnchor | null
       const finalRow = finalAnchor ? locateVoiceViewportAnchor(finalAnchor, prepared) : null

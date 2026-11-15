@@ -199,13 +199,46 @@ describe.skipIf(process.platform !== 'win32')('微信语音控制流程（原生
     expect(native.commands.filter((command) => command.command === 'select')).toHaveLength(2)
   })
 
-  it('不断变化的候选达到本屏上限后明确停止，避免无限扫描', async () => {
-    let snapshots = 0
+  it('超过本屏候选上限后明确停止，避免无限扫描', async () => {
     native.respond = (command) => command.command === 'snapshot'
-      ? snapshot([], `frame-${++snapshots}`, [text('[语音]3秒', 100, `moving-${snapshots}`)])
+      ? { ...snapshot([], 'many-voices', Array.from({ length: 121 }, (_, index) => text('[语音]3秒', 100 + index * 40, `voice-${index}`))),
+          crop: { x: 0, y: 0, width: 800, height: 6000 } }
       : command.command === 'open' ? { action: 'expanded' } : {}
     await expect(start().convertVisible({ isCancelled: () => false })).rejects.toThrow('本屏语音位置持续变化')
     expect(native.commands.filter((command) => command.command === 'open')).toHaveLength(120)
+  })
+
+  it('同屏多条已展开语音只做一次识别，不为每个右键菜单重新全屏 OCR', async () => {
+    native.respond = (command) => command.command === 'snapshot'
+      ? snapshot([text('3″', 100), text('7″', 250), text('9″', 400)])
+      : command.command === 'open' ? { action: 'expanded' } : {}
+    expect(await start().convertVisible({ isCancelled: () => false })).toMatchObject({ alreadyConverted: 3 })
+    expect(native.commands.filter((command) => command.command === 'snapshot')).toHaveLength(1)
+    expect(native.commands.filter((command) => command.command === 'open')).toHaveLength(3)
+  })
+
+  it('滚到下一屏时跳过像素确认的已检查语音，只检查新进入画面的同秒语音', async () => {
+    let page = 0
+    native.respond = (command) => command.command === 'snapshot'
+      ? snapshot(page === 0 ? [text('3″', 200), text('7″', 400)] : [text('3″', 80), text('7″', 280), text('3″', 500)], `page-${page}`)
+      : command.command === 'open' ? { action: 'expanded' } : {}
+    const controller = start()
+    expect(await controller.convertVisible({ isCancelled: () => false })).toMatchObject({ detected: 2 })
+    page = 1
+    expect(await controller.convertVisible({ isCancelled: () => false, previousViewportShiftRatio: -0.2 })).toMatchObject({ detected: 1 })
+    expect(native.commands.filter((command) => command.command === 'open').map((command) => command.y)).toEqual([210, 410, 510])
+  })
+
+  it('无可靠画面重叠时不复用上屏状态，同秒和复用的 UIA 标识都重新确认', async () => {
+    let page = 0
+    native.respond = (command) => command.command === 'snapshot'
+      ? snapshot([], `page-${page}`, [text('[语音]3秒', page ? 80 : 200, 'recycled-id')])
+      : command.command === 'open' ? { action: 'expanded' } : {}
+    const controller = start()
+    await controller.convertVisible({ isCancelled: () => false })
+    page = 1
+    await controller.convertVisible({ isCancelled: () => false })
+    expect(native.commands.filter((command) => command.command === 'open').map((command) => command.y)).toEqual([210, 90])
   })
 
   it('转写文字与已有文字重复时，通过收起文字菜单确认成功', async () => {

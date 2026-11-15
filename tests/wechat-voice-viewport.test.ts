@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { createVoiceViewportAnchor, locateVoiceViewportAnchor } from '../src/main/services/wechat-voice-viewport'
+import { createVoiceViewportAnchor, locateVoiceViewportAnchor, reusableVoiceViewportShift } from '../src/main/services/wechat-voice-viewport'
 import type { VoiceScanFrame } from '../src/main/services/wechat-voice-viewport'
 import { continuousFrameDecision, findVerticalOverlap } from '../src/shared/wechat-capture'
 
@@ -87,5 +87,48 @@ describe('语音展开后当前视口的像素锚点', () => {
     const match = findVerticalOverlap(previous.fingerprint, restored.fingerprint, 64, 100, 0.35, 0.995)
     expect(match).toEqual({ overlap: 62, score: 0 })
     expect(continuousFrameDecision(match, 1000, 100)).toEqual({ kind: 'append', overlap: 620, shift: 380 })
+  })
+})
+
+describe('逐屏语音检查的重叠区复用', () => {
+  function textured(): VoiceScanFrame {
+    const result = frame()
+    let seed = 42
+    for (let i = 0; i < result.fingerprint.length; i += 1) {
+      seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0
+      result.fingerprint[i] = seed >>> 24
+    }
+    return result
+  }
+
+  it('唯一且未变化的重叠画面返回滚动比例，新进入底部内容不影响复用', () => {
+    const previous = textured()
+    const next = shift(previous, -20)
+    next.fingerprint.fill(72, 80 * next.fingerprintWidth)
+    expect(reusableVoiceViewportShift(previous, next)).toBe(-0.2)
+  })
+
+  it('纯色与重复图案即使匹配分数完美，也不能当作同一条语音', () => {
+    const blank = frame()
+    blank.fingerprint.fill(245)
+    expect(reusableVoiceViewportShift(blank, shift(blank, -20))).toBeUndefined()
+    const repeated = textured()
+    for (let row = 10; row < 100; row += 1) {
+      repeated.fingerprint.set(repeated.fingerprint.slice((row % 10) * 64, (row % 10 + 1) * 64), row * 64)
+    }
+    expect(reusableVoiceViewportShift(repeated, shift(repeated, -20))).toBeUndefined()
+  })
+
+  it('重叠区内文字被收起或更改时废弃缓存，不能漏转后来恢复的语音', () => {
+    const previous = textured()
+    const changed = shift(previous, -20)
+    changed.fingerprint.fill(245, 40 * 64, 42 * 64)
+    expect(reusableVoiceViewportShift(previous, changed)).toBeUndefined()
+  })
+
+  it('窗口大小变化或滚动过远时重新完整检查当前屏', () => {
+    const previous = textured()
+    expect(reusableVoiceViewportShift(previous, { ...shift(previous, -20), height: 900 })).toBeUndefined()
+    expect(reusableVoiceViewportShift(previous, shift(previous, -70))).toBeUndefined()
   })
 })
