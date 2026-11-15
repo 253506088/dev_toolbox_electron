@@ -8,10 +8,17 @@ import {
   continuousSafeStripRegion,
   findVerticalOverlap,
   normalizedImageDifference,
-  planScreenSlices
+  planScreenSlices,
+  validateWechatVoiceOptions
 } from '../src/shared/wechat-capture'
 
 describe('微信长截图图像匹配', () => {
+  it('只接受受支持的窗口采集方式', () => {
+    for (const captureMethod of [undefined, 'window', 'screen'] as const) {
+      expect(() => validateWechatVoiceOptions({ captureMethod })).not.toThrow()
+    }
+    expect(() => validateWechatVoiceOptions({ captureMethod: 'other' as 'window' })).toThrow('窗口采集方式无效')
+  })
   it('识别完全相同和明显不同的画面', () => {
     expect(normalizedImageDifference(Uint8Array.from([0, 127, 255]), Uint8Array.from([0, 127, 255]))).toBe(0)
     expect(normalizedImageDifference(Uint8Array.from([0, 0]), Uint8Array.from([255, 255]))).toBe(1)

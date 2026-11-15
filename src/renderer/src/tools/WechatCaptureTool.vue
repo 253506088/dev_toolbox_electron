@@ -49,7 +49,7 @@ const selectedWindow = computed(() => windows.value.find((item) => item.id === s
 const isWechatWindow = computed(() => selectedWindow.value?.application === 'wechat')
 const canConvertVoice = computed(() => isWechatWindow.value)
 const windowOptions = computed(() => windows.value.map((item) => ({
-  label: `[${item.applicationLabel || '其他'}] ${item.name}${isWindowCapturable(item) ? '' : '（需恢复窗口后刷新）'}`,
+  label: `[${item.applicationLabel || '其他'}] ${item.name}${isWindowCapturable(item) ? '' : `（${item.unavailableReason ?? '预览暂不可用，请刷新'}）`}`,
   value: item.id
 })))
 const isFinished = computed(() =>
@@ -110,6 +110,7 @@ async function startCapture(): Promise<void> {
     const common = {
       sourceId: selectedWindow.value.id,
       sourceName: selectedWindow.value.name,
+      captureMethod: selectedWindow.value.captureMethod,
       outputDirectory: outputDirectory.value,
       crop: { ...crop },
       startFromTop: startFromTop.value,
@@ -272,8 +273,9 @@ function formatError(error: unknown): string {
             @update:crop="applyCrop"
           />
         </div>
-        <div v-else-if="selectedWindow" class="empty-preview">该窗口可能已最小化，请恢复窗口后刷新列表</div>
+        <div v-else-if="selectedWindow" class="empty-preview">{{ selectedWindow.unavailableReason ?? '预览暂不可用，请刷新' }}</div>
         <div v-else class="empty-preview">请打开目标窗口后刷新</div>
+        <p v-if="selectedWindow?.captureMethod === 'screen'" class="option-hint">此窗口使用屏幕画面采集，请保持窗口完整可见且不被遮挡。</p>
 
         <section class="capture-status" :class="{ visible: progress }" aria-live="polite">
           <div class="capture-status-heading">
@@ -322,7 +324,7 @@ function formatError(error: unknown): string {
         <p class="option-hint">默认从当前位置向下截图；需要完整记录时可勾选回到顶部。</p>
         <div v-if="isWechatWindow" class="voice-option">
           <NCheckbox v-model:checked="convertVoiceToText" :disabled="running || !canConvertVoice">自动将语音转为文字</NCheckbox>
-          <p class="option-hint">每屏截图前检查未转文字的语音，转写完成并稳定后再截图，然后继续向下。</p>
+          <p class="option-hint">从所选起点边截图边检查语音，仅处理当前画面尚未转写的内容；处理完当前屏就截图并继续向下。</p>
           <p v-if="convertVoiceToText" class="voice-note">请保持微信聊天窗口可见，转写时避免操作鼠标或切换聊天。按 Ctrl+E 可随时停止。</p>
         </div>
         <template v-if="captureMode === 'continuous'">

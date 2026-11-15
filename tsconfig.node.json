@@ -15,6 +15,9 @@
     "src/preload/**/*.ts",
     "src/shared/**/*.ts",
     "tests/wechat-ocr-integration.test.ts",
-    "tests/wechat-voice*.test.ts"
+    "tests/wechat-voice*.test.ts",
+    "tests/wechat-scroll-*.test.ts",
+    "tests/window-capture-*.test.ts",
+    "tests/native-window-*.test.ts"
   ]
 }

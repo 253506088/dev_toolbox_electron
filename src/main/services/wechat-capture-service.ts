@@ -1,6 +1,6 @@
 import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
-import { app, desktopCapturer, globalShortcut, type WebContents } from 'electron'
+import { app, globalShortcut, type WebContents } from 'electron'
 import sharp from 'sharp'
 import {
   acceptedOverlapHeight,
@@ -21,7 +21,8 @@ import {
   type ScrollDriver,
   TargetWindowMinimizedError
 } from './wechat-scroll-controller'
-import { nativeCaptureSize } from './capture-resolution'
+import { captureWindowPng, listWindowCaptureSources } from './window-capture-source'
+import { assertCaptureSize, type CaptureSize } from './window-capture-size'
 import { CaptureTimingLog } from './capture-timing-log'
 import { WechatVoicePreparation } from './wechat-voice-preparation'
 
@@ -38,6 +39,7 @@ interface ActiveRun {
   log: CaptureTimingLog
   voice?: WechatVoicePreparation<CapturedFrame>
   voiceConversion?: WechatVoiceConversionStats
+  captureSize?: CaptureSize
 }
 
 interface CapturedFrame {
@@ -59,25 +61,22 @@ export class WechatCaptureService {
 
   /** 返回全部可截图窗口；常用通信软件和浏览器置顶，其余按预览面积降序。 */
   async listWindows(): Promise<WechatWindowSource[]> {
-    const sources = await desktopCapturer.getSources({
-      types: ['window'],
-      // 预览直接用于精确框选，也作为视频流最低清晰度基线，不能为枚举提速而降采样。
-      thumbnailSize: nativeCaptureSize(),
-      fetchWindowIcons: true
-    })
+    const sources = await listWindowCaptureSources()
     return sources
       .map((source) => {
-        const size = source.thumbnail.getSize()
+        const size = source.image?.getSize() ?? { width: 0, height: 0 }
         const application = identifyApplication(source.name)
-        const capturable = !source.thumbnail.isEmpty() && size.width > 0 && size.height > 0
+        const capturable = Boolean(source.image && !source.image.isEmpty() && size.width > 0 && size.height > 0)
         return {
           captureApiVersion: WECHAT_CAPTURE_API_VERSION,
           id: source.id,
           name: source.name || '未命名窗口',
-          thumbnailDataUrl: capturable ? source.thumbnail.toDataURL() : source.appIcon?.toDataURL() ?? '',
+          thumbnailDataUrl: capturable ? source.image!.toDataURL() : source.icon?.toDataURL() ?? '',
           width: capturable ? size.width : 0,
           height: capturable ? size.height : 0,
           capturable,
+          captureMethod: source.captureMethod,
+          unavailableReason: source.unavailableReason,
           application: application.id,
           applicationLabel: application.label
         }
@@ -312,14 +311,12 @@ export class WechatCaptureService {
   }
 
   private async capture(run: ActiveRun, request: WechatCaptureRequest): Promise<CapturedFrame> {
-    const sources = await run.log.measure('frame.capture.enumerate_windows', () =>
-      desktopCapturer.getSources({ types: ['window'], thumbnailSize: nativeCaptureSize() }))
-    const source = sources.find((candidate) => candidate.id === request.sourceId)
-    if (!source || source.thumbnail.isEmpty()) throw new Error('目标窗口已关闭或无法读取')
-    const image = sharp(source.thumbnail.toPNG())
+    const png = await run.log.measure('frame.capture.window', () => captureWindowPng(request.sourceId, request.captureMethod))
+    const image = sharp(png)
     const metadata = await image.metadata()
     if (!metadata.width || !metadata.height) throw new Error('无法读取目标窗口尺寸')
     const region = cropToPixels(request.crop, metadata.width, metadata.height)
+    assertCaptureSize(run, region)
     const buffer = await run.log.measure('frame.capture.crop_encode', () => image.extract(region).png().toBuffer(), region)
     const fingerprintHeight = Math.max(24, Math.round(region.height * FINGERPRINT_WIDTH / region.width))
     const fingerprint = await run.log.measure('frame.capture.fingerprint', () =>

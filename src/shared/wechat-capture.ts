@@ -1,5 +1,5 @@
 /** 逐屏按需转写协议；提示开发环境完整重启旧主进程。 */
-export const WECHAT_CAPTURE_API_VERSION = 4
+export const WECHAT_CAPTURE_API_VERSION = 5
 
 /** 可供滚动截图工具选择的桌面窗口。 */
 export interface WechatWindowSource {
@@ -10,8 +10,11 @@ export interface WechatWindowSource {
   thumbnailDataUrl: string
   width: number
   height: number
-  /** false 通常表示窗口已最小化，仍列出但需要恢复后刷新预览。 */
+  /** 是否已取得有效预览；无缩略图不代表窗口已最小化。 */
   capturable: boolean
+  /** 屏幕兼容采集要求目标窗口完整可见，支持其他显示器与混合 DPI。 */
+  captureMethod?: 'window' | 'screen'
+  unavailableReason?: string
   /** 已识别应用；unknown 表示自定义窗口。 */
   application: 'wechat' | 'qq' | 'browser' | 'office' | 'ide' | 'terminal' | 'codex' | 'feishu' | 'dingtalk' | 'unknown'
   applicationLabel: string
@@ -28,6 +31,7 @@ export interface WechatCaptureCrop {
 /** 启动一次滚动窗口抓取所需的参数。 */
 export interface WechatCaptureRequest {
   sourceId: string
+  captureMethod?: 'window' | 'screen'
   sourceName: string
   outputDirectory: string
   crop: WechatCaptureCrop
@@ -43,6 +47,7 @@ export interface WechatCaptureRequest {
 /** 连续长截图节点使用的采样和滚动参数。 */
 export interface WechatContinuousCaptureRequest {
   sourceId: string
+  captureMethod?: 'window' | 'screen'
   sourceName: string
   outputDirectory: string
   crop: WechatCaptureCrop
@@ -69,7 +74,10 @@ export interface WechatVoiceConversionStats {
 }
 
 /** 同时供两种采集模式校验，避免隐式改变用户选择的截图起点。 */
-export function validateWechatVoiceOptions(request: { convertVoiceToText?: boolean; startFromTop?: boolean }): void {
+export function validateWechatVoiceOptions(request: { convertVoiceToText?: boolean; startFromTop?: boolean; captureMethod?: 'window' | 'screen' }): void {
+  if (request.captureMethod !== undefined && request.captureMethod !== 'window' && request.captureMethod !== 'screen') {
+    throw new Error('窗口采集方式无效')
+  }
   if (request.startFromTop !== undefined && typeof request.startFromTop !== 'boolean') {
     throw new Error('截图起点参数无效')
   }

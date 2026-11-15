@@ -72,6 +72,11 @@ vi.mock('../src/main/services/capture-resolution', () => ({
   nativeCaptureSize: () => ({ width: 100, height: 100 })
 }))
 
+vi.mock('../src/main/services/window-capture-source', () => ({
+  captureWindowPng: async () => mocks.frame.buffer,
+  listWindowCaptureSources: async () => []
+}))
+
 vi.mock('../src/main/services/wechat-scroll-controller', () => ({
   FRAME_STILL_THRESHOLD: 0.0035,
   WechatScrollController: {

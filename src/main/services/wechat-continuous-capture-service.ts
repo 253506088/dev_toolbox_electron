@@ -1,6 +1,6 @@
 import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
-import { app, desktopCapturer, globalShortcut, type WebContents } from 'electron'
+import { app, globalShortcut, type WebContents } from 'electron'
 import sharp from 'sharp'
 import {
   computeBlankRows,
@@ -28,6 +28,8 @@ import { nativeCaptureSize } from './capture-resolution'
 import { VideoFrameSourceService } from './video-frame-source-service'
 import { CaptureTimingLog } from './capture-timing-log'
 import { WechatVoicePreparation } from './wechat-voice-preparation'
+import { captureWindowPng } from './window-capture-source'
+import { assertCaptureSize, CaptureSizeChangedError, type CaptureSize } from './window-capture-size'
 
 const LONG_IMAGE_HEIGHT = 20_000
 const STOP_HOTKEY = 'CommandOrControl+E'
@@ -57,6 +59,7 @@ interface ContinuousRun {
   log: CaptureTimingLog
   voice?: WechatVoicePreparation<ContinuousFrame>
   voiceConversion?: WechatVoiceConversionStats
+  captureSize?: CaptureSize
 }
 
 interface FrameReport {
@@ -216,38 +219,46 @@ export class WechatContinuousCaptureService {
           }
         })
       }
-      try {
-        const opened = await run.log.measure('frame_source.open', () => this.videoFrameSource.open({
-          sourceId: request.sourceId,
-          crop: request.crop,
-          maxSize: nativeCaptureSize(),
-          minimumSize: request.expectedSize,
-          fingerprintWidth: 320
-        }))
-        this.frameSourceFallbackReason = null
-        if (request.expectedSize && opened.meetsMinimumSize) {
-          this.frameSourceMode = 'video-stream'
-          this.frameSourceNote = null
-        } else {
-          this.frameSourceMode = 'video-settle-only'
-          this.frameSourceNote =
-            `视频流 ${opened.width}×${opened.height} 仅用于判稳；` +
-            `输出继续使用原生分辨率 ${request.expectedSize?.width ?? '?'}×${request.expectedSize?.height ?? '?'}`
-          run.log.record('frame_source.settle_only', undefined, {
-            videoWidth: opened.width,
-            videoHeight: opened.height,
-            outputMinimumWidth: request.expectedSize?.width,
-            outputMinimumHeight: request.expectedSize?.height
-          })
-          this.emit(run, 'positioning', this.frameSourceNote, 0, 0)
-        }
-      } catch (error) {
+      if (request.captureMethod === 'screen') {
         this.frameSourceMode = 'desktop-capturer'
-        this.frameSourceFallbackReason = error instanceof Error ? error.message : String(error)
+        this.frameSourceFallbackReason = '所选窗口使用屏幕兼容采集'
         this.frameSourceNote = null
-        await this.videoFrameSource.close()
-        run.log.record('frame_source.fallback', undefined, { reason: this.frameSourceFallbackReason })
-        this.emit(run, 'positioning', `视频流不可用，已降级为兼容模式（较慢）：${this.frameSourceFallbackReason}`, 0, 0)
+        run.log.record('frame_source.screen_capture')
+        this.emit(run, 'positioning', '正在采集目标所在屏幕的画面，请保持窗口完整可见', 0, 0)
+      } else {
+        try {
+          const opened = await run.log.measure('frame_source.open', () => this.videoFrameSource.open({
+            sourceId: request.sourceId,
+            crop: request.crop,
+            maxSize: nativeCaptureSize(),
+            minimumSize: request.expectedSize,
+            fingerprintWidth: 320
+          }))
+          this.frameSourceFallbackReason = null
+          if (request.expectedSize && opened.meetsMinimumSize) {
+            this.frameSourceMode = 'video-stream'
+            this.frameSourceNote = null
+          } else {
+            this.frameSourceMode = 'video-settle-only'
+            this.frameSourceNote =
+              `视频流 ${opened.width}×${opened.height} 仅用于判稳；` +
+              `输出继续使用原生分辨率 ${request.expectedSize?.width ?? '?'}×${request.expectedSize?.height ?? '?'}`
+            run.log.record('frame_source.settle_only', undefined, {
+              videoWidth: opened.width,
+              videoHeight: opened.height,
+              outputMinimumWidth: request.expectedSize?.width,
+              outputMinimumHeight: request.expectedSize?.height
+            })
+            this.emit(run, 'positioning', this.frameSourceNote, 0, 0)
+          }
+        } catch (error) {
+          this.frameSourceMode = 'desktop-capturer'
+          this.frameSourceFallbackReason = error instanceof Error ? error.message : String(error)
+          this.frameSourceNote = null
+          await this.videoFrameSource.close()
+          run.log.record('frame_source.fallback', undefined, { reason: this.frameSourceFallbackReason })
+          this.emit(run, 'positioning', `视频流不可用，已降级为兼容模式（较慢）：${this.frameSourceFallbackReason}`, 0, 0)
+        }
       }
       const startFromTop = request.startFromTop === true
       this.emit(
@@ -610,7 +621,7 @@ export class WechatContinuousCaptureService {
           captureMs: performance.now() - captureStartedAt
         }
       } catch (error) {
-        if (error instanceof CaptureCancelledError) throw error
+        if (error instanceof CaptureCancelledError || error instanceof CaptureSizeChangedError) throw error
         this.frameSourceFallbackReason = error instanceof Error ? error.message : String(error)
         this.activeRun?.log.record('frame_source.fallback', undefined, { reason: this.frameSourceFallbackReason, stage: 'settle' })
         this.frameSourceMode = 'desktop-capturer'
@@ -630,6 +641,7 @@ export class WechatContinuousCaptureService {
     if (this.frameSourceMode === 'video-stream') {
       try {
         const frame = await this.measureActive('frame.capture.video_fingerprint', () => this.videoFrameSource.fingerprint())
+        if (this.activeRun) assertCaptureSize(this.activeRun, frame)
         return {
           buffer: null,
           width: frame.width,
@@ -640,6 +652,7 @@ export class WechatContinuousCaptureService {
           videoFrameId: frame.frameId
         }
       } catch (error) {
+        if (error instanceof CaptureSizeChangedError) throw error
         this.frameSourceFallbackReason = error instanceof Error ? error.message : String(error)
         this.activeRun?.log.record('frame_source.fallback', undefined, { reason: this.frameSourceFallbackReason, stage: 'fingerprint' })
         this.frameSourceMode = 'desktop-capturer'
@@ -647,16 +660,12 @@ export class WechatContinuousCaptureService {
         await this.videoFrameSource.close()
       }
     }
-    const sources = await this.measureActive(
-      'frame.capture.compatible_enumerate_windows',
-      () => desktopCapturer.getSources({ types: ['window'], thumbnailSize: nativeCaptureSize() })
-    )
-    const source = sources.find((candidate) => candidate.id === request.sourceId)
-    if (!source || source.thumbnail.isEmpty()) throw new Error('目标窗口已关闭或无法读取')
-    const image = sharp(source.thumbnail.toPNG())
+    const png = await this.measureActive('frame.capture.compatible_window', () => captureWindowPng(request.sourceId, request.captureMethod))
+    const image = sharp(png)
     const metadata = await image.metadata()
     if (!metadata.width || !metadata.height) throw new Error('无法读取目标窗口尺寸')
     const region = cropToPixels(request.crop, metadata.width, metadata.height)
+    if (this.activeRun) assertCaptureSize(this.activeRun, region)
     const buffer = await this.measureActive(
       'frame.capture.compatible_crop_encode',
       () => image.extract(region).png().toBuffer(),

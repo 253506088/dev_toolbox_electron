@@ -22,6 +22,7 @@ import { MediaSourceService } from './services/media-source-service'
 import { WechatCaptureService } from './services/wechat-capture-service'
 import { WechatContinuousCaptureService } from './services/wechat-continuous-capture-service'
 import { WechatExportService } from './services/wechat-export-service'
+import { nativeWindowCapture } from './services/native-window-capture'
 
 protocol.registerSchemesAsPrivileged([
   { scheme: 'note-image', privileges: { standard: true, secure: true, supportFetchAPI: true } },
@@ -116,6 +117,7 @@ app.whenReady().then(() => {
 })
 
 app.on('before-quit', () => {
+  nativeWindowCapture.dispose()
   reminderScheduler?.stop()
   batchTasks?.stopAll()
   ffmpegService?.stopAll()
