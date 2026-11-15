@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import type { BrowserWindow } from 'electron'
 import type { StickyNote } from '../../shared/electron-api'
 import type { HolidayService } from './holiday-service'
 import type { NoteService } from './note-service'
@@ -26,7 +27,7 @@ function reminder(id: string, minute: number, type: 'daily' | 'workday' = 'daily
   }
 }
 
-function scheduler(notes: StickyNote[], isWorkday = vi.fn().mockResolvedValue(true)) {
+function scheduler(notes: StickyNote[], isWorkday = vi.fn().mockResolvedValue(true), window: BrowserWindow | null = null) {
   const markReminderTriggered = vi.fn(async (id: string, triggeredAt: string) => {
     const note = notes.find((item) => item.id === id)!
     note.reminder!.lastTriggered = triggeredAt
@@ -37,7 +38,24 @@ function scheduler(notes: StickyNote[], isWorkday = vi.fn().mockResolvedValue(tr
     markReminderTriggered
   } as unknown as NoteService
   const holidays = { isWorkday, getMonth: vi.fn().mockResolvedValue([]) } as unknown as HolidayService
-  return { scheduler: new ReminderScheduler(service, holidays, () => null), markReminderTriggered, isWorkday }
+  return { scheduler: new ReminderScheduler(service, holidays, () => window), markReminderTriggered, isWorkday }
+}
+
+function testWindow(initial = { focused: false, visible: true, minimized: false, alwaysOnTop: false }) {
+  const state = { ...initial }
+  const window = {
+    isDestroyed: vi.fn(() => false),
+    isFocused: vi.fn(() => state.focused),
+    isVisible: vi.fn(() => state.visible),
+    isMinimized: vi.fn(() => state.minimized),
+    isAlwaysOnTop: vi.fn(() => state.alwaysOnTop),
+    restore: vi.fn(() => { state.minimized = false; state.visible = true }),
+    show: vi.fn(() => { state.visible = true }),
+    focus: vi.fn(() => { state.focused = true }),
+    setAlwaysOnTop: vi.fn((value: boolean) => { state.alwaysOnTop = value }),
+    webContents: { send: vi.fn() }
+  }
+  return { window, electronWindow: window as unknown as BrowserWindow, state }
 }
 
 describe('提醒调度稳定性', () => {
@@ -64,6 +82,52 @@ describe('提醒调度稳定性', () => {
     expect(native.notify).toHaveBeenCalledOnce()
   })
 
+  it('启动时已聚焦的窗口不重复显示、聚焦或切换置顶，所有提醒仍入队', async () => {
+    const target = testWindow({ focused: true, visible: true, minimized: false, alwaysOnTop: false })
+    const state = scheduler([reminder('first', 0), reminder('second', 0)], undefined, target.electronWindow)
+
+    await state.scheduler.checkNow()
+
+    expect(target.window.show).not.toHaveBeenCalled()
+    expect(target.window.focus).not.toHaveBeenCalled()
+    expect(target.window.setAlwaysOnTop).not.toHaveBeenCalled()
+    expect(target.window.webContents.send.mock.calls.map((call) => call[1].id)).toEqual(['first', 'second'])
+  })
+
+  it('同批多个提醒只恢复、聚焦和临时置顶一次，并只在十秒后撤销一次', async () => {
+    const target = testWindow({ focused: false, visible: false, minimized: true, alwaysOnTop: false })
+    // 系统可能拒绝抢焦点，同批提醒也不应重复尝试。
+    target.window.focus.mockImplementation(() => {})
+    const state = scheduler([reminder('first', 0), reminder('second', 0)], undefined, target.electronWindow)
+
+    await state.scheduler.checkNow()
+
+    expect(target.window.restore).toHaveBeenCalledOnce()
+    expect(target.window.focus).toHaveBeenCalledOnce()
+    expect(target.window.show).not.toHaveBeenCalled()
+    expect(target.window.setAlwaysOnTop.mock.calls).toEqual([[true]])
+    await vi.advanceTimersByTimeAsync(10_000)
+    expect(target.window.setAlwaysOnTop.mock.calls).toEqual([[true], [false]])
+  })
+
+  it('停止调度立即清理本次临时置顶，定时器不会再重复改变窗口', async () => {
+    const target = testWindow()
+    const state = scheduler([reminder('first', 0)], undefined, target.electronWindow)
+    await state.scheduler.checkNow()
+    state.scheduler.stop()
+    await vi.advanceTimersByTimeAsync(20_000)
+    expect(target.window.setAlwaysOnTop.mock.calls).toEqual([[true], [false]])
+  })
+
+  it('保留窗口原有的置顶状态', async () => {
+    const target = testWindow({ focused: false, visible: true, minimized: false, alwaysOnTop: true })
+    const state = scheduler([reminder('first', 0)], undefined, target.electronWindow)
+    await state.scheduler.checkNow()
+    await vi.advanceTimersByTimeAsync(20_000)
+    state.scheduler.stop()
+    expect(target.window.setAlwaysOnTop).not.toHaveBeenCalled()
+  })
+
   it('慢请求跨分钟后补查新一分钟，不漏掉另一条到期便签', async () => {
     let finishHoliday!: (value: boolean) => void
     const holiday = new Promise<boolean>((resolve) => { finishHoliday = resolve })
@@ -80,6 +144,30 @@ describe('提醒调度稳定性', () => {
 
     expect(state.markReminderTriggered.mock.calls.map(([id]) => id)).toEqual(['work', 'next-minute'])
     expect(native.notify).toHaveBeenCalledTimes(2)
+  })
+
+  it('跨分钟补查会再次恢复用户在上一分钟提醒后最小化的窗口', async () => {
+    let finishHoliday!: (value: boolean) => void
+    const holiday = new Promise<boolean>((resolve) => { finishHoliday = resolve })
+    const target = testWindow()
+    const state = scheduler([
+      reminder('daily', 0), reminder('slow-workday', 0, 'workday'), reminder('next-minute', 1)
+    ], vi.fn(() => holiday), target.electronWindow)
+
+    const check = state.scheduler.checkNow()
+    await vi.waitFor(() => expect(state.isWorkday).toHaveBeenCalledOnce())
+    expect(target.window.focus).toHaveBeenCalledOnce()
+    target.state.minimized = true
+    target.state.visible = false
+    target.state.focused = false
+    vi.setSystemTime(new Date(2026, 10, 16, 9, 1))
+    finishHoliday(true)
+    await check
+
+    expect(target.window.restore).toHaveBeenCalledOnce()
+    expect(target.window.focus).toHaveBeenCalledTimes(2)
+    expect(target.window.webContents.send.mock.calls.map((call) => call[1].id)).toEqual(['daily', 'slow-workday', 'next-minute'])
+    state.scheduler.stop()
   })
 
   it('未到时间的工作日便签不启动网络查询，也不阻塞当前提醒', async () => {

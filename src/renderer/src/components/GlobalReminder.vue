@@ -29,7 +29,7 @@ onBeforeUnmount(() => unsubscribe?.())
 </script>
 
 <template>
-  <NModal :show="pendingNotes.length > 0" preset="card" class="reminder-modal" style="width: min(480px, 92vw)" :mask-closable="false" @update:show="!$event && dismissReminder()" @after-leave="leavingNote = null">
+  <NModal :show="pendingNotes.length > 0" preset="card" class="reminder-modal" style="width: min(480px, 92vw)" transform-origin="center" :mask-closable="false" @update:show="!$event && dismissReminder()" @after-leave="leavingNote = null">
     <div v-if="note" class="reminder-content">
       <NIcon :component="AlarmClock" :size="42" color="#f97316" />
       <h2>便签提醒<span v-if="pendingNotes.length > 1" class="reminder-count">（待确认 {{ pendingNotes.length }} 条）</span></h2>
@@ -43,6 +43,8 @@ onBeforeUnmount(() => unsubscribe?.())
 </template>
 
 <style scoped>
+/* 到期提醒直接以最终尺寸出现，避免默认从鼠标位置缩放带来的文字虚化和跳动。 */
+:global(.reminder-modal.n-modal) { transform: none !important; transition: none !important; }
 .reminder-content { display: flex; flex-direction: column; align-items: center; gap: 12px; }
 .reminder-content h2 { margin: 0; font-size: var(--ui-font-xxl); }
 .reminder-count { color: var(--text-muted); font-size: var(--ui-font-sm); font-weight: 400; }

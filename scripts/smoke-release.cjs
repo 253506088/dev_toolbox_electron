@@ -42,16 +42,18 @@ if (packaged) {
 delete process.env.ELECTRON_RENDERER_URL
 
 const report = {
-  target, output, electron: process.versions.electron, packaged, startedAt: new Date().toISOString(),
-  console: [], errors: [], checks: [], screenshots: [], windowMoves: [], notifications: 0, beeps: 0
+  target, output, electron: process.versions.electron, packaged, windowMode: 'visible-inactive', startedAt: new Date().toISOString(),
+  console: [], errors: [], checks: [], screenshots: [], windowMoves: [], nativeMoveEvents: [], notifications: 0, beeps: 0
 }
 let mainWindow
 let complete = false
 let expectedResize = false
+let monitorWindowPosition = false
 const originals = []
 const baselineModules = new Set(Object.keys(require.cache))
-// A hidden test window still runs the real renderer/preload. Suppress only native
-// attention side effects so reminders never steal focus or create system toasts.
+// Run the real renderer/preload in a visible, inactive test window: Windows
+// throttles hidden compositor frames to 1 Hz even with backgroundThrottling off.
+// Suppress attention side effects so reminders cannot steal focus or send toasts.
 function replace(object, name, replacement) {
   originals.push([object, name, object[name]])
   object[name] = replacement
@@ -96,7 +98,15 @@ app.on('browser-window-created', (_event, window) => {
   if (mainWindow) return
   mainWindow = window
   window.webContents.setBackgroundThrottling(false)
-  window.on('move', () => { if (!expectedResize) report.windowMoves.push(window.getBounds()) })
+  window.once('ready-to-show', () => window.showInactive())
+  let previousBounds = window.getBounds()
+  window.on('move', () => {
+    const bounds = window.getBounds()
+    const event = { phase: report.phase, time: Date.now(), bounds, previousBounds, expected: expectedResize || !monitorWindowPosition }
+    report.nativeMoveEvents.push(event)
+    if (!event.expected && (bounds.x !== previousBounds.x || bounds.y !== previousBounds.y)) report.windowMoves.push(event)
+    previousBounds = bounds
+  })
   window.webContents.on('console-message', (details) => {
     report.console.push({ level: details.level, message: details.message })
     if (details.level === 'error') report.errors.push({ source: 'renderer-console', message: details.message })
@@ -117,7 +127,7 @@ require(entry)
 
 function installDiagnostics() {
   if (window.__releaseSmoke) return
-  const state = window.__releaseSmoke = { phase: 'startup', frames: [], errors: [], layoutShifts: [] }
+  const state = window.__releaseSmoke = { phase: 'startup', frames: [], frameCount: 0, dialogs: [], errors: [], layoutShifts: [] }
   window.addEventListener('error', (event) => state.errors.push(event.message))
   window.addEventListener('unhandledrejection', (event) => state.errors.push(String(event.reason)))
   try {
@@ -137,17 +147,33 @@ function installDiagnostics() {
       if (Math.min(r.x + r.width, s.x + s.width) - Math.max(r.x, s.x) > 1 && Math.min(r.y + r.height, s.y + s.height) - Math.max(r.y, s.y) > 1) overlaps++
     }
     const host = document.querySelector('.notes-scroll')
-    if (host && state.frames.length < 2400) state.frames.push({ phase: state.phase, time: performance.now(), count: cards.length, overlaps, rectangles })
-    // rAF runs before ResizeObserver; sampling there can report intermediate
-    // geometry that is corrected before paint. A following task observes the
-    // completed rendering update, including the masonry observer's writes.
-    requestAnimationFrame(() => setTimeout(sample, 0))
+    if (host) {
+      if (state.frames.length >= 20_000) state.frames.splice(0, 10_000)
+      state.frames.push({ sequence: ++state.frameCount, phase: state.phase, time: performance.now(), count: cards.length, overlaps, rectangles, mountedCount: document.querySelectorAll('.note-card').length })
+    }
+    for (const dialog of document.querySelectorAll('.reminder-modal, .note-editor-modal')) {
+      const style = getComputedStyle(dialog)
+      if (state.dialogs.length < 20_000) state.dialogs.push({ phase: state.phase, class: dialog.className, transform: style.transform, filter: style.filter })
+    }
+    // Native columns have no observer writes. Reading the rectangles resolves
+    // layout in this frame; avoid chained timers, which hidden windows throttle.
+    requestAnimationFrame(sample)
   }
-  requestAnimationFrame(() => setTimeout(sample, 0))
+  requestAnimationFrame(sample)
 }
 
 async function evaluate(fn, argument) {
-  return mainWindow.webContents.executeJavaScript(`(${fn.toString()})(${JSON.stringify(argument)})`)
+  let timer
+  try {
+    return await Promise.race([
+      mainWindow.webContents.executeJavaScript(`(${fn.toString()})(${JSON.stringify(argument)})`),
+      new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`Renderer evaluation timed out (${report.phase}); visible=${mainWindow.isVisible()}, minimized=${mainWindow.isMinimized()}`)), 8000)
+      })
+    ])
+  } finally {
+    clearTimeout(timer)
+  }
 }
 async function waitFor(fn, description, timeoutMs = 15_000) {
   report.phase = description
@@ -190,6 +216,23 @@ async function screenshot(name) {
   fs.writeFileSync(destination, capture.toPNG())
   report.screenshots.push(destination)
 }
+async function verifyIdleLayout(phase) {
+  await stableFrame(phase)
+  const start = await evaluate(() => window.__releaseSmoke.frameCount)
+  await evaluate((offset) => new Promise((resolve) => {
+    const started = performance.now()
+    function check() {
+      if (window.__releaseSmoke.frameCount >= offset + 30 && performance.now() - started >= 600) resolve(true)
+      else requestAnimationFrame(check)
+    }
+    requestAnimationFrame(check)
+  }), start)
+  const frames = await evaluate((offset) => window.__releaseSmoke.frames.filter((frame) => frame.sequence > offset), start)
+  assert(frames.length >= 3, `Insufficient rendered frames for ${phase}`)
+  assert(frames.every((frame) => frame.count === notes.length && frame.mountedCount === notes.length), `Cards became hidden during ${phase}`)
+  assert.equal(new Set(frames.map((frame) => JSON.stringify(frame.rectangles))).size, 1, `Idle note layout kept moving during ${phase}`)
+  report.checks.push({ name: 'idle-note-stability', phase, frames: frames.length })
+}
 async function click(selector) {
   await evaluate((query) => {
     const element = document.querySelector(query)
@@ -204,6 +247,10 @@ async function runChecks() {
   await waitFor(() => [...document.querySelectorAll('.note-images img')].every((image) => image.complete && image.naturalWidth > 0), 'note images load')
   await waitFor(() => document.querySelector('.reminder-count')?.textContent.includes('2'), 'both startup reminders reach the queue', Math.max(15_000, minuteRemaining + 4000))
   await stableFrame('reminder-first')
+  // Initial Windows show/placement is expected; subsequent reminder updates and
+  // idle frames must not move the window. Keep every native event for diagnosis.
+  monitorWindowPosition = true
+  await verifyIdleLayout('startup-reminder-idle')
   report.checks.push({ name: 'startup-reminder-queue', count: 2, first: await evaluate(() => document.querySelector('.reminder-note').textContent) })
   assert.match(report.checks.at(-1).first, /启动提醒 1/)
   await screenshot('01-startup-reminder')
@@ -215,6 +262,7 @@ async function runChecks() {
   await click('.reminder-content .n-button')
   await waitFor(() => !document.querySelector('.reminder-content'), 'reminder closes without an empty card')
   await stableFrame('notes-default')
+  await verifyIdleLayout('startup-notes-idle')
   await screenshot('03-notes-default')
   await click('.note-card-actions .n-button')
   await waitFor(() => Boolean(document.querySelector('.note-editor-modal textarea')), 'note editor opens')
@@ -251,10 +299,21 @@ async function runChecks() {
     await evaluate((phase) => { window.__releaseSmoke.phase = phase }, `resize-${name}`)
     expectedResize = true
     mainWindow.setSize(width, height)
-    expectedResize = false
     await stableFrame(`resize-${name}`)
+    expectedResize = false
     await screenshot(`04-notes-${name}`)
   }
+  for (const zoom of [1.25, 1.5, 1]) {
+    await evaluate((phase) => { window.__releaseSmoke.phase = phase }, `zoom-${zoom}`)
+    mainWindow.webContents.setZoomFactor(zoom)
+    await verifyIdleLayout(`zoom-${zoom}`)
+    if (zoom !== 1) await screenshot(`04-notes-zoom-${zoom}`)
+  }
+  await evaluate(() => [...document.querySelectorAll('.tool-nav-button')].find((button) => button.textContent.includes('时间转换')).click())
+  await waitFor(() => document.querySelector('.tool-title')?.textContent.includes('时间转换'), 'another tool opens')
+  await evaluate(() => { window.__releaseSmoke.phase = 'notes-reactivated'; [...document.querySelectorAll('.tool-nav-button')].find((button) => button.textContent.includes('便签与提醒')).click() })
+  await waitFor(() => document.querySelectorAll('.note-card').length === 8, 'cached notes return')
+  await verifyIdleLayout('notes-reactivated')
   await click('.note-images img')
   await waitFor(() => Boolean(document.querySelector('.viewer-stage img')?.naturalWidth), 'full image viewer')
   await screenshot('05-image-viewer')
@@ -294,12 +353,16 @@ async function runChecks() {
       element = element.parentElement
     }
     const state = window.__releaseSmoke
-    return { ...state, devicePixelRatio, ancestry, readyCount: document.querySelectorAll('.note-cell[data-masonry-ready]').length }
+    return { ...state, devicePixelRatio, ancestry, readyCount: document.querySelectorAll('.note-cell').length, columnWidth: getComputedStyle(document.querySelector('.notes-columns')).columnWidth }
   })
   assert.equal(report.layout.readyCount, notes.length)
+  assert.equal(report.layout.columnWidth, '270px', 'Notes should use native content layout')
   assert.equal(report.layout.errors.length, 0, `Renderer exceptions: ${report.layout.errors.join('; ')}`)
   const overlaps = report.layout.frames.filter((frame) => frame.overlaps > 0)
   assert.equal(overlaps.length, 0, `Visible cards overlapped in ${overlaps.length} rendered frames`)
+  assert(report.layout.frames.every((frame) => frame.count === frame.mountedCount), 'Mounted notes were hidden before a measurement pass')
+  assert(report.layout.dialogs.some((dialog) => dialog.class.includes('reminder-modal')), 'Startup reminder animation was not sampled')
+  assert(report.layout.dialogs.every((dialog) => dialog.transform === 'none' && dialog.filter === 'none'), 'A reminder or note editor scaled/blurred text during its transition')
   assert(report.layout.ancestry.every((item) => item.filter === 'none' && item.transform === 'none'), 'Notes inherit blur or transform')
   assert.equal(report.errors.length, 0, `Errors: ${JSON.stringify(report.errors)}`)
   assert.equal(report.windowMoves.length, 0, 'Application moved the test window unexpectedly')

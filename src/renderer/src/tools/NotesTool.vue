@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onActivated, onBeforeUnmount, onMounted, ref, type Directive } from 'vue'
+import { computed, onActivated, onMounted, ref } from 'vue'
 import { AlarmClock, CalendarDays, ImagePlus, Plus, Search, Trash2, X } from '@lucide/vue'
 import {
   NButton, NEmpty, NIcon, NInput, NModal, NPopconfirm, NSelect, NSwitch, NTooltip, useMessage
@@ -9,7 +9,6 @@ import { hasSameReminderSchedule } from '@shared/reminder-rules'
 import ToolPage from '../components/ToolPage.vue'
 import HolidayCalendar from '../components/HolidayCalendar.vue'
 import NoteImageViewer from '../components/NoteImageViewer.vue'
-import { createMasonryLayout } from '../utils/masonry-layout'
 
 const message = useMessage()
 const notes = ref<StickyNote[]>([])
@@ -32,15 +31,7 @@ const viewerVisible = ref(false)
 const viewerImages = ref<string[]>([])
 const viewerIndex = ref(0)
 const fileInput = ref<HTMLInputElement>()
-const masonry = createMasonryLayout()
 let pendingLoad: Promise<void> | undefined
-
-/** 根据卡片真实高度分配网格行，让后续卡片自动填入当前最短列。 */
-const vMasonryItem: Directive<HTMLElement> = {
-  mounted: (element) => masonry.observe(element),
-  beforeUnmount: (element) => masonry.unobserve(element)
-}
-onBeforeUnmount(() => masonry.disconnect())
 
 const filteredNotes = computed(() => {
   const keyword = search.value.trim().toLowerCase()
@@ -287,7 +278,7 @@ function formatError(error: unknown): string {
       <div v-if="loading && notes.length === 0" class="notes-loading" role="status">正在读取便签…</div>
       <NEmpty v-else-if="filteredNotes.length === 0" description="暂无便签" class="notes-empty" />
       <div v-else class="notes-columns">
-        <div v-for="note in filteredNotes" :key="note.id" v-masonry-item class="note-cell">
+        <div v-for="note in filteredNotes" :key="note.id" class="note-cell">
           <article class="note-card" :style="{ background: note.color }" @dblclick="openEdit(note)">
             <div class="note-card-actions">
               <NButton size="tiny" quaternary @dblclick.stop @click.stop="openEdit(note)">编辑</NButton>
@@ -307,7 +298,7 @@ function formatError(error: unknown): string {
     </div>
   </ToolPage>
 
-  <NModal :show="editorVisible" preset="card" :title="editingId ? '编辑便签' : '新建便签'" class="note-editor-modal" style="width: min(720px, 94vw)" :mask-closable="false" @update:show="!$event && cancelEditor()">
+  <NModal :show="editorVisible" preset="card" :title="editingId ? '编辑便签' : '新建便签'" class="note-editor-modal" style="width: min(720px, 94vw)" transform-origin="center" :mask-closable="false" @update:show="!$event && cancelEditor()">
     <div class="note-editor-drop" @dragover.prevent @drop="handleDrop">
       <textarea v-model="editorContent" rows="8" placeholder="输入便签内容，或粘贴截图..." @paste="handlePaste" />
       <div v-if="editorImages.length" class="editor-image-list">
@@ -343,10 +334,10 @@ function formatError(error: unknown): string {
 .notes-scroll { height: 100%; overflow: auto; scrollbar-gutter: stable; padding: 2px 3px 12px 2px; outline: none; }
 .notes-loading { padding: 24px; color: var(--text-muted); text-align: center; }
 .notes-empty { margin-top: 18vh; }
-.notes-columns { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(270px, 100%), 1fr)); grid-auto-flow: row dense; grid-auto-rows: 8px; gap: 12px; align-items: start; }
-.note-cell { min-width: 0; }
-/* 在首轮测量前不绘制挤在单行中的卡片，避免文字叠加造成模糊和闪烁。 */
-.note-cell:not([data-masonry-ready]) { visibility: hidden; }
+/* 原生分栏直接按内容排版，避免启动、缩放和字体变化时在微网格行高与
+   ResizeObserver 测量之间反复重排。卡片从第一帧起就有真实高度。 */
+.notes-columns { columns: 270px; column-gap: 12px; }
+.note-cell { display: inline-block; width: 100%; min-width: 0; margin: 0 0 12px; break-inside: avoid; vertical-align: top; }
 .note-card { position: relative; width: 100%; padding: 14px; color: #20302f; border: 1px solid rgb(32 48 47 / 28%); border-radius: 6px; box-shadow: 0 2px 7px rgb(22 78 72 / 16%); }
 .note-card p { min-height: 44px; margin: 22px 0 10px; line-height: 1.6; white-space: pre-wrap; overflow-wrap: anywhere; }
 .note-card-actions { position: absolute; top: 5px; right: 5px; display: flex; }
@@ -366,4 +357,6 @@ function formatError(error: unknown): string {
 .reminder-type { width: 142px; }
 .reminder-settings input { height: 34px; padding: 0 6px; color: var(--text-color); border: 1px solid var(--border-color); border-radius: 4px; background: var(--surface-color); }
 .modal-actions { display: flex; justify-content: flex-end; gap: 8px; }
+/* 缩放弹窗会将文字先栅格化后拉伸，尤其在 Windows 非整数 DPI 下显得模糊。 */
+:global(.note-editor-modal.n-modal) { transform: none !important; transition: opacity 120ms ease !important; }
 </style>
