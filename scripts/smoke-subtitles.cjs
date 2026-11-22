@@ -36,7 +36,10 @@ fs.mkdirSync(profile)
 app.setPath('userData', profile)
 app.setPath('sessionData', profile)
 app.setAppPath(packaged ? target : root)
-if (packaged) Object.defineProperty(process, 'resourcesPath', { value: path.dirname(target) })
+if (packaged) {
+  Object.defineProperty(app, 'isPackaged', { value: true })
+  Object.defineProperty(process, 'resourcesPath', { value: path.dirname(target) })
+}
 delete process.env.ELECTRON_RENDERER_URL
 
 const ffmpeg = packaged ? path.join(path.dirname(target), 'ffmpeg', 'ffmpeg.exe') : path.join(root, 'resources', 'ffmpeg', 'ffmpeg.exe')
@@ -66,6 +69,7 @@ BrowserWindow.prototype.show = function () { this.showInactive() }
 let mainWindow
 let completed = false
 const report = { target, output, checks: [], screenshots: [], errors: [] }
+const baselineModules = new Set(Object.keys(require.cache))
 app.on('browser-window-created', (_event, window) => {
   if (!mainWindow) {
     mainWindow = window
@@ -174,6 +178,21 @@ async function run() {
   assert(!overflow.body && overflow.startVisible, JSON.stringify(overflow))
   assert.equal(report.errors.length, 0, report.errors.join('\n'))
   report.checks.push('light-dark-minimum-window-layout')
+  if (packaged) {
+    const appRequire = require('node:module').createRequire(entry)
+    const insidePackage = (file) => [target, `${target}.unpacked`].some((packageRoot) => {
+      const relative = path.relative(packageRoot, file)
+      return relative !== '..' && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative)
+    })
+    report.version = JSON.parse(fs.readFileSync(path.join(target, 'package.json'), 'utf8')).version
+    report.dependencies = ['iconv-lite', 'sharp', '@img/sharp-win32-x64/sharp.node', 'csv-parse/sync']
+      .map((id) => ({ id, path: appRequire.resolve(id) }))
+    for (const dependency of report.dependencies) assert(insidePackage(dependency.path), `Dependency resolved outside package: ${dependency.id}`)
+    for (const file of Object.keys(require.cache).filter((file) => !baselineModules.has(file))) {
+      assert(insidePackage(file), `Application loaded a development dependency: ${file}`)
+    }
+    report.checks.push('self-contained-packaged-dependencies')
+  }
   finish()
 }
 function finish(error) {
