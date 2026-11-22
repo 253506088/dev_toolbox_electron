@@ -4,6 +4,7 @@ import { app, BrowserWindow, net, protocol, shell } from 'electron'
 import { registerDictionaryIpc } from './ipc/dictionary-ipc'
 import { registerFilesIpc } from './ipc/files-ipc'
 import { registerMediaIpc } from './ipc/media-ipc'
+import { registerSubtitleIpc } from './ipc/subtitle-ipc'
 import { registerNotesIpc } from './ipc/notes-ipc'
 import { registerTextIpc } from './ipc/text-ipc'
 import { registerUtilityIpc } from './ipc/utility-ipc'
@@ -14,6 +15,7 @@ import { FileService } from './services/file-service'
 import { FolderSizePool } from './services/folder-size-pool'
 import { BatchTaskService } from './services/batch-task-service'
 import { FfmpegService } from './services/ffmpeg-service'
+import { SubtitleService } from './services/subtitle-service'
 import { HolidayService } from './services/holiday-service'
 import { NoteService } from './services/note-service'
 import { ReminderScheduler } from './services/reminder-scheduler'
@@ -33,6 +35,8 @@ let mainWindow: BrowserWindow | null = null
 let reminderScheduler: ReminderScheduler | null = null
 let batchTasks: BatchTaskService | null = null
 let ffmpegService: FfmpegService | null = null
+let subtitleService: SubtitleService | null = null
+let waitingForSubtitleShutdown = false
 let wechatCapture: WechatCaptureService | null = null
 let wechatContinuousCapture: WechatContinuousCaptureService | null = null
 let wechatExport: WechatExportService | null = null
@@ -90,6 +94,7 @@ async function bootstrap(): Promise<void> {
   const images = new ImageService(mediaSources)
   batchTasks = new BatchTaskService()
   ffmpegService = new FfmpegService(mediaSources)
+  subtitleService = new SubtitleService(ffmpegService)
   wechatCapture = new WechatCaptureService()
   wechatContinuousCapture = new WechatContinuousCaptureService()
   wechatExport = new WechatExportService()
@@ -100,6 +105,7 @@ async function bootstrap(): Promise<void> {
   registerUtilityIpc()
   registerDictionaryIpc(dictionary)
   registerMediaIpc(images, batchTasks, ffmpegService)
+  registerSubtitleIpc(subtitleService)
   registerWechatCaptureIpc(wechatCapture, wechatContinuousCapture)
   registerWechatExportIpc(wechatExport)
   registerNoteImageProtocol(notes)
@@ -116,11 +122,22 @@ app.whenReady().then(() => {
   })
 })
 
-app.on('before-quit', () => {
+app.on('before-quit', (event) => {
   nativeWindowCapture.dispose()
   reminderScheduler?.stop()
   batchTasks?.stopAll()
   ffmpegService?.stopAll()
+  // Windows 必须等 FFmpeg 释放文件后才能删除半成品，退出前完成清理。
+  if (subtitleService?.hasRunning()) {
+    event.preventDefault()
+    if (!waitingForSubtitleShutdown) {
+      waitingForSubtitleShutdown = true
+      void subtitleService.stopAll().then(() => app.quit(), (error: unknown) => {
+        console.error('字幕任务退出清理失败', error)
+        app.quit()
+      })
+    }
+  }
   wechatCapture?.dispose()
   wechatContinuousCapture?.dispose()
   wechatExport?.dispose()

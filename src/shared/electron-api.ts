@@ -248,6 +248,8 @@ export interface ElectronApi {
     onProgress(callback: (progress: DictionaryProgress) => void): () => void
   }
   media: MediaApi
+  /** 智能匹配并批量封装视频外挂字幕。 */
+  subtitles: import('./subtitle-api').SubtitleApi
 }
 import type { MediaApi } from './media-api'
 import type {

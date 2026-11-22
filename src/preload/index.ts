@@ -8,6 +8,7 @@ import type {
 } from '../shared/electron-api'
 import type { BatchTaskEvent } from '../shared/batch-task'
 import type { MediaJobEvent } from '../shared/media-api'
+import type { SubtitleBatchSnapshot } from '../shared/subtitle-api'
 import type { WechatCaptureEvent } from '../shared/wechat-capture'
 import type { WechatExportEvent } from '../shared/wechat-export'
 import type { CaptureFrameSourceBridge, CaptureFrameSourceCommand, CaptureFrameSourceResult } from '../shared/capture-frame-source'
@@ -83,6 +84,17 @@ const api: ElectronApi = {
     translateAndSave: (tag) => ipcRenderer.invoke('dictionary:translate-and-save', tag),
     exportIncremental: () => ipcRenderer.invoke('dictionary:export-incremental'),
     onProgress: (callback) => subscribe<DictionaryProgress>('dictionary:progress', callback)
+  },
+  subtitles: {
+    selectFolder: () => ipcRenderer.invoke('subtitle:select-folder'),
+    selectVideo: () => ipcRenderer.invoke('subtitle:select-video'),
+    scanPath: (path) => ipcRenderer.invoke('subtitle:scan-path', path),
+    selectSubtitle: (scanId, rowId) => ipcRenderer.invoke('subtitle:select-subtitle', scanId, rowId),
+    start: (request) => ipcRenderer.invoke('subtitle:start', request),
+    cancel: (batchId) => ipcRenderer.invoke('subtitle:cancel', batchId),
+    snapshot: () => ipcRenderer.invoke('subtitle:snapshot'),
+    openOutput: (batchId) => ipcRenderer.invoke('subtitle:open-output', batchId),
+    onEvent: (callback) => subscribe<SubtitleBatchSnapshot>('subtitle:event', callback)
   },
   media: {
     selectImages: (multiple) => ipcRenderer.invoke('media:select-images', multiple),

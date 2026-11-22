@@ -17,6 +17,7 @@ import {
   NotebookPen,
   QrCode,
   ScanLine,
+  Subtitles,
   TableProperties,
   TextQuote,
   WandSparkles,
@@ -90,6 +91,13 @@ export const tools: ToolRegistration[] = [
     group: '图片与视频',
     icon: Film,
     component: defineAsyncComponent(() => import('./VideoFrameTool.vue'))
+  },
+  {
+    id: 'subtitle-embed',
+    name: '外挂字幕内嵌',
+    group: '图片与视频',
+    icon: Subtitles,
+    component: defineAsyncComponent(() => import('./SubtitleEmbedTool.vue'))
   },
   {
     id: 'video-matting',
