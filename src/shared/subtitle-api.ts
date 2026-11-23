@@ -5,6 +5,8 @@ export const SUBTITLE_EXTENSIONS = ['srt', 'ass', 'ssa', 'vtt'] as const
 export type SubtitleConfidence = 'high' | 'medium' | 'low'
 export type SubtitleEncoding = 'auto' | 'utf8' | 'gb18030' | 'big5' | 'shift_jis'
 export type SubtitleOutputFormat = 'mkv' | 'mp4'
+/** 烧录字幕直接成为画面；内置字幕轨需要播放器支持。 */
+export type SubtitleEmbedMode = 'burn' | 'soft'
 
 export interface SubtitleCandidate {
   path: string
@@ -37,6 +39,8 @@ export interface SubtitleScanResult {
 export interface SubtitleBatchRequest {
   scanId: string
   items: Array<{ rowId: string; subtitlePath: string }>
+  /** 缺省使用烧录，确保普通播放器直接显示字幕。 */
+  mode?: SubtitleEmbedMode
   format: SubtitleOutputFormat
   encoding: SubtitleEncoding
   offsetSeconds: number
@@ -59,6 +63,7 @@ export interface SubtitleBatchItem {
 
 export interface SubtitleBatchSnapshot {
   batchId: string
+  mode: SubtitleEmbedMode
   outputDirectory: string
   status: 'running' | 'completed' | 'cancelled'
   items: SubtitleBatchItem[]

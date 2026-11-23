@@ -50,7 +50,7 @@ function command(args) {
   return result.stdout
 }
 const videos = [1, 2, 3].map((episode) => path.join(directory, `Example.Show.S01E0${episode}.1080p.WEB-DL.mp4`))
-command(['-hide_banner', '-loglevel', 'error', '-f', 'lavfi', '-i', 'testsrc2=size=160x90:rate=12', '-f', 'lavfi', '-i', 'sine=frequency=440', '-t', '3', '-c:v', 'libx264', '-c:a', 'aac', '-y', videos[0]])
+command(['-hide_banner', '-loglevel', 'error', '-f', 'lavfi', '-i', 'color=c=blue:size=640x360:rate=12', '-f', 'lavfi', '-i', 'sine=frequency=440', '-t', '3', '-c:v', 'libx264', '-c:a', 'aac', '-y', videos[0]])
 for (const video of videos.slice(1)) fs.copyFileSync(videos[0], video)
 const subtitles = [1, 2].map((episode) => path.join(directory, `示例剧集.Example.Show.1x0${episode}.chs.srt`))
 for (const [index, file] of subtitles.entries()) fs.writeFileSync(file, `1\n00:00:00,200 --> 00:00:02,500\n合成字幕 第${index + 1}集\n`, 'utf8')
@@ -58,6 +58,24 @@ const manualSubtitle = path.join(output, '手动字幕.srt')
 fs.writeFileSync(manualSubtitle, '1\n00:00:00,200 --> 00:00:02,500\n手动选择的第三集字幕\n', 'utf8')
 const hash = (file) => crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex')
 const sources = [...videos, ...subtitles, manualSubtitle].map((file) => ({ file, hash: hash(file) }))
+
+function burnedFramePixels(file, seconds) {
+  const result = spawnSync(ffmpeg, ['-v', 'error', '-ss', String(seconds), '-i', file, '-sn', '-frames:v', '1', '-pix_fmt', 'rgb24', '-f', 'rawvideo', '-'], { windowsHide: true, timeout: 20_000, maxBuffer: 2 * 1024 * 1024 })
+  assert.equal(result.status, 0, result.stderr?.toString())
+  assert.equal(result.stdout.length, 640 * 360 * 3)
+  let white = 0
+  for (let offset = 280 * 640 * 3; offset < result.stdout.length; offset += 3) {
+    if (result.stdout[offset] > 140 && result.stdout[offset + 1] > 140 && result.stdout[offset + 2] > 140) white++
+  }
+  return white
+}
+function verifyBurnedVideo(file) {
+  const info = spawnSync(ffmpeg, ['-hide_banner', '-i', file], { encoding: 'utf8', windowsHide: true, timeout: 20_000 }).stderr
+  assert(info.includes('Video: h264') && info.includes('Audio: aac'), info)
+  assert(!info.includes('Subtitle:'), 'Burned video must display captions without a subtitle stream')
+  assert.equal(burnedFramePixels(file, 0), 0)
+  assert(burnedFramePixels(file, 1) > 20, 'Chinese caption pixels must exist in the video frame itself')
+}
 
 const selections = []
 dialog.showOpenDialog = async () => {
@@ -130,6 +148,7 @@ async function run() {
     [...document.querySelectorAll('.tool-nav-button')].find((button) => button.textContent.includes('外挂字幕内嵌')).click()
   })
   await waitFor(() => Boolean(document.querySelector('[data-testid="subtitle-select-folder"]')), 'subtitle page mounts')
+  assert(await evaluate(() => document.querySelector('[data-testid="subtitle-mode-burn"]')?.getAttribute('aria-pressed') === 'true'), 'New page must default to visible burned captions')
   await screenshot('empty-light')
   selections.push(directory)
   await click('[data-testid="subtitle-select-folder"]')
@@ -148,8 +167,9 @@ async function run() {
   assert.equal(first.items.length, 1, 'Deselected and unmatched videos must not process')
   assert(first.items[0].videoPath.endsWith('S01E01.1080p.WEB-DL.mp4'))
   assert.equal(first.outputDirectory, path.join(directory, '内嵌字幕处理+合成剧集'))
-  assert(command(['-v', 'error', '-i', first.items[0].outputPath, '-map', '0:s:0', '-f', 'srt', '-']).includes('合成字幕 第1集'))
-  report.checks.push('folder-match-default-selection-deselection-unmatched-skip-background-mux')
+  assert.equal(first.mode, 'burn')
+  verifyBurnedVideo(first.items[0].outputPath)
+  report.checks.push('default-burn-folder-match-selection-background-encoding')
   await evaluate(() => { [...document.querySelectorAll('.tool-nav-button')].find((button) => button.textContent.includes('外挂字幕内嵌')).click() })
   await screenshot('completed-light')
 
@@ -163,13 +183,17 @@ async function run() {
   await click('[data-testid="subtitle-start"]')
   const second = await waitBatch(first.batchId)
   assert.equal(second.items.length, 1)
-  assert(command(['-v', 'error', '-i', second.items[0].outputPath, '-map', '0:s:0', '-f', 'srt', '-']).includes('手动选择的第三集字幕'))
+  assert.equal(second.mode, 'burn')
+  verifyBurnedVideo(second.items[0].outputPath)
   await evaluate((id) => { window.__subtitlePreviousId = id }, second.batchId)
   await click('[data-testid="subtitle-start"]')
   const third = await waitBatch(second.batchId)
   assert.notEqual(third.items[0].outputPath, second.items[0].outputPath, 'Repeated runs must preserve previous output')
   for (const source of sources) assert.equal(hash(source.file), source.hash, `Source was modified: ${source.file}`)
   report.checks.push('single-video-manual-subtitle-repeated-output-source-integrity')
+  await click('[data-testid="subtitle-mode-soft"]')
+  assert(await evaluate(() => document.querySelector('[data-testid="subtitle-mode-soft"]')?.getAttribute('aria-pressed') === 'true'))
+  await click('[data-testid="subtitle-mode-burn"]')
 
   await evaluate(() => document.querySelector('button[aria-label="切换为暗色主题"]')?.click())
   mainWindow.setContentSize(960, 640)
@@ -178,6 +202,42 @@ async function run() {
   assert(!overflow.body && overflow.startVisible, JSON.stringify(overflow))
   assert.equal(report.errors.length, 0, report.errors.join('\n'))
   report.checks.push('light-dark-minimum-window-layout')
+
+  const videoOnly = path.join(output, 'video-only')
+  fs.mkdirSync(videoOnly)
+  const portableVideo = path.join(videoOnly, 'copied-and-renamed.mp4')
+  fs.copyFileSync(first.items[0].outputPath, portableVideo)
+  assert.equal(fs.readdirSync(videoOnly).length, 1, 'Delivery directory must contain only the video')
+  for (const fixturePath of [directory, `${directory}-isolated`, manualSubtitle, `${manualSubtitle}.isolated`]) {
+    const relative = path.relative(output, fixturePath)
+    assert(relative && !relative.startsWith('..') && !path.isAbsolute(relative), 'Only synthetic fixture paths may be moved')
+  }
+  fs.renameSync(directory, `${directory}-isolated`)
+  fs.renameSync(manualSubtitle, `${manualSubtitle}.isolated`)
+  verifyBurnedVideo(portableVideo)
+  report.checks.push('renamed-video-only-delivery-source-paths-unavailable')
+  await evaluate(async (file) => {
+    const metadata = await window.electronApi.media.registerVideo(file)
+    const video = document.createElement('video')
+    video.id = 'subtitle-portability-player'
+    video.muted = true
+    video.controls = true
+    video.playsInline = true
+    video.style.cssText = 'position:fixed;z-index:99999;left:210px;top:100px;width:640px;height:360px;background:blue;'
+    video.src = metadata.previewUrl
+    document.body.append(video)
+    await video.play()
+  }, portableVideo)
+  await waitFor(() => document.querySelector('#subtitle-portability-player')?.currentTime >= 0.8, 'ordinary HTML5 video plays copied product')
+  report.browserPlayback = await evaluate(() => {
+    const video = document.querySelector('#subtitle-portability-player')
+    video.pause()
+    return { currentTime: video.currentTime, width: video.videoWidth, height: video.videoHeight, textTracks: video.textTracks.length, decodedFrames: video.getVideoPlaybackQuality().totalVideoFrames }
+  })
+  assert.equal(report.browserPlayback.textTracks, 0)
+  assert(report.browserPlayback.decodedFrames > 0)
+  await screenshot('copied-video-html5-visible-captions')
+  report.checks.push('ordinary-html5-player-shows-captions-without-subtitle-tracks')
   if (packaged) {
     const appRequire = require('node:module').createRequire(entry)
     const insidePackage = (file) => [target, `${target}.unpacked`].some((packageRoot) => {

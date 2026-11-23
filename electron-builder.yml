@@ -15,6 +15,11 @@ extraResources:
     to: ffmpeg
     filter:
       - ffmpeg.exe
+  - from: resources/subtitle-fonts
+    to: subtitle-fonts
+    filter:
+      - NotoSansSC.ttf
+      - OFL.txt
 win:
   icon: resources/icon.ico
   target:

@@ -31,6 +31,10 @@ Thumbs.db
 # FFmpeg 下载产物，由 pnpm ffmpeg:prepare 准备，不将可执行文件入库。
 resources/ffmpeg/ffmpeg.exe
 
+# 固定版本的 OFL 中文字体下载缓存，由 pnpm subtitle-font:prepare 校验并随包携带。
+# 字体许可、来源说明与准备脚本正常提交；烧录后的用户视频不依赖这些文件。
+resources/subtitle-fonts/*.ttf
+
 # 私人设计文档与本地调试资料；根目录的开发指南与更新日志正常提交。
 /my_doc/*
 

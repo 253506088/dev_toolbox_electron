@@ -1,6 +1,6 @@
 {
   "name": "dev-toolbox-electron",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "description": "基于 Electron、Vue 3 和 TypeScript 的开发者工具箱",
   "main": "./out/main/index.js",
   "author": "253506088",
@@ -9,14 +9,15 @@
   "scripts": {
     "dictionary:build": "node --experimental-strip-types scripts/build-dictionary.mts",
     "ffmpeg:prepare": "node --experimental-strip-types scripts/prepare-ffmpeg.mts",
-    "dev": "electron-vite dev",
+    "subtitle-font:prepare": "node --experimental-strip-types scripts/prepare-subtitle-font.mts",
+    "dev": "node --experimental-strip-types scripts/prepare-subtitle-font.mts && electron-vite dev",
     "start": "electron-vite preview",
     "typecheck": "vue-tsc --noEmit -p tsconfig.web.json && tsc --noEmit -p tsconfig.node.json",
     "test": "vitest run",
     "smoke:release": "node scripts/smoke-release.cjs",
-    "build": "vue-tsc --noEmit -p tsconfig.web.json && tsc --noEmit -p tsconfig.node.json && electron-vite build",
-    "pack": "pnpm ffmpeg:prepare && vue-tsc --noEmit -p tsconfig.web.json && tsc --noEmit -p tsconfig.node.json && electron-vite build && electron-builder --dir",
-    "dist": "pnpm ffmpeg:prepare && vue-tsc --noEmit -p tsconfig.web.json && tsc --noEmit -p tsconfig.node.json && electron-vite build && electron-builder"
+    "build": "node --experimental-strip-types scripts/prepare-subtitle-font.mts && vue-tsc --noEmit -p tsconfig.web.json && tsc --noEmit -p tsconfig.node.json && electron-vite build",
+    "pack": "pnpm ffmpeg:prepare && node --experimental-strip-types scripts/prepare-subtitle-font.mts && vue-tsc --noEmit -p tsconfig.web.json && tsc --noEmit -p tsconfig.node.json && electron-vite build && electron-builder --dir",
+    "dist": "pnpm ffmpeg:prepare && node --experimental-strip-types scripts/prepare-subtitle-font.mts && vue-tsc --noEmit -p tsconfig.web.json && tsc --noEmit -p tsconfig.node.json && electron-vite build && electron-builder"
   },
   "dependencies": {
     "csv-parse": "6.1.0",

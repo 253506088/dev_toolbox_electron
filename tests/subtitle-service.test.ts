@@ -8,7 +8,7 @@ import { basename, join, resolve } from 'node:path'
 import type { WebContents } from 'electron'
 import iconv from 'iconv-lite'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
-import { buildSubtitleMuxArgs, decodeSubtitle, parseSubtitleVideoProbe, SubtitleService } from '../src/main/services/subtitle-service'
+import { buildSubtitleBurnArgs, buildSubtitleMuxArgs, decodeSubtitle, parseSubtitleVideoProbe, SubtitleService } from '../src/main/services/subtitle-service'
 import { shiftSubtitleTimestamps } from '../src/shared/subtitle-timing'
 import type { SubtitleBatchRequest, SubtitleBatchSnapshot, SubtitleScanResult } from '../src/shared/subtitle-api'
 
@@ -26,7 +26,7 @@ class FakeOwner extends EventEmitter {
 function owner(value: FakeOwner): WebContents { return value as unknown as WebContents }
 function service(): SubtitleService { return new SubtitleService({ status: async () => ({ available: true, path: executable, message: 'Ready' }) }) }
 function request(scan: SubtitleScanResult, overrides: Partial<SubtitleBatchRequest> = {}): SubtitleBatchRequest {
-  return { scanId: scan.scanId, items: scan.rows.filter((row) => row.subtitlePath).map((row) => ({ rowId: row.id, subtitlePath: row.subtitlePath! })), format: 'mkv', encoding: 'auto', offsetSeconds: 0, ...overrides }
+  return { scanId: scan.scanId, items: scan.rows.filter((row) => row.subtitlePath).map((row) => ({ rowId: row.id, subtitlePath: row.subtitlePath! })), mode: 'soft', format: 'mkv', encoding: 'auto', offsetSeconds: 0, ...overrides }
 }
 function ffmpeg(args: string[]): string {
   const result = spawnSync(executable, args, { encoding: 'utf8', windowsHide: true, timeout: 30_000, maxBuffer: 1024 * 1024 })
@@ -51,6 +51,19 @@ function waitDone(service: SubtitleService, fake: FakeOwner, batchId: string): P
 }
 
 describe('外挂字幕编码和封装参数', () => {
+  it('烧录滤镜不包含用户路径，H264/AAC 成品无需字幕流，ASS 保留其字体样式', () => {
+    const args = buildSubtitleBurnArgs("D:\\中文 [视频],单引号'\\movie.mp4", 'subtitle.srt', "D:\\输出 [电影],单引号'\\movie.mp4", 'mp4')
+    const filter = args[args.indexOf('-vf') + 1]
+    expect(filter).toContain('subtitles=filename=subtitle.srt:fontsdir=fonts')
+    expect(filter).toContain("FontName=Noto Sans SC")
+    expect(filter).not.toContain('D:')
+    expect(args[args.indexOf('-c:v') + 1]).toBe('libx264')
+    expect(args[args.indexOf('-c:a') + 1]).toBe('aac')
+    expect(args).toContain('-sn')
+    const ass = buildSubtitleBurnArgs('input.mkv', 'subtitle.ass', 'output.mp4', 'mp4')
+    expect(ass[ass.indexOf('-vf') + 1]).not.toContain('force_style')
+    expect(() => buildSubtitleBurnArgs('input.mp4', "subtitle.srt:bad='path'", 'output.mp4', 'mp4')).toThrow('文件名无效')
+  })
   it('识别 UTF-8、UTF-16 BOM、GB18030 并支持显式 Big5', () => {
     expect(decodeSubtitle(Buffer.from(`\uFEFF${srt}`), 'auto')).toBe(srt)
     expect(decodeSubtitle(Buffer.concat([Buffer.from([0xff, 0xfe]), iconv.encode(srt, 'utf16le')]), 'auto')).toBe(srt)
