@@ -19,5 +19,5 @@
     }
   },
   "include": ["src/renderer/src/**/*.ts", "src/renderer/src/**/*.vue", "src/shared/**/*.ts", "tests/**/*.ts"],
-  "exclude": ["tests/wechat-ocr-integration.test.ts", "tests/wechat-voice-*.test.ts", "tests/wechat-scroll-*.test.ts", "tests/window-capture-*.test.ts", "tests/native-window-*.test.ts", "tests/subtitle-service.test.ts", "tests/subtitle-burn.test.ts"]
+  "exclude": ["tests/wechat-ocr-integration.test.ts", "tests/wechat-voice-*.test.ts", "tests/wechat-scroll-*.test.ts", "tests/window-capture-*.test.ts", "tests/native-window-*.test.ts", "tests/subtitle-service.test.ts", "tests/subtitle-burn.test.ts", "tests/subtitle-encoding.test.ts", "tests/subtitle-runtime.test.ts"]
 }

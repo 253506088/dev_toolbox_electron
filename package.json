@@ -1,6 +1,6 @@
 {
   "name": "dev-toolbox-electron",
-  "version": "0.1.5",
+  "version": "0.1.6",
   "description": "基于 Electron、Vue 3 和 TypeScript 的开发者工具箱",
   "main": "./out/main/index.js",
   "author": "253506088",

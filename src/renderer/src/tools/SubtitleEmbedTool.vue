@@ -3,7 +3,7 @@ import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { Ban, CheckCheck, ChevronRight, CircleCheck, FileVideo, FolderOpen, ListChecks, Play, RefreshCw, RotateCcw, Search, ShieldCheck, Subtitles, Upload } from '@lucide/vue'
 import { NButton, NCheckbox, NIcon, NInput, NInputNumber, NPagination, NProgress, NSelect, NTag, NTooltip, useMessage } from 'naive-ui'
 import type { FfmpegStatus } from '@shared/media-api'
-import type { SubtitleBatchSnapshot, SubtitleConfidence, SubtitleEmbedMode, SubtitleEncoding, SubtitleMatchRow, SubtitleOutputFormat, SubtitleScanResult } from '@shared/subtitle-api'
+import type { SubtitleAcceleration, SubtitleBatchItem, SubtitleBatchSnapshot, SubtitleConfidence, SubtitleEmbedMode, SubtitleEncoding, SubtitleHardwareStatus, SubtitleMatchRow, SubtitleOutputFormat, SubtitleProcessingPhase, SubtitleResolution, SubtitleScanResult } from '@shared/subtitle-api'
 import ToolPage from '../components/ToolPage.vue'
 
 const message = useMessage()
@@ -20,10 +20,15 @@ const filter = ref('all')
 const page = ref(1)
 const embedMode = ref<SubtitleEmbedMode>('burn')
 const format = ref<SubtitleOutputFormat>('mp4')
+const acceleration = ref<SubtitleAcceleration>('auto')
+const resolution = ref<SubtitleResolution>('source')
 const encoding = ref<SubtitleEncoding>('auto')
 const offsetSeconds = ref<number | null>(0)
 const ffmpeg = ref<FfmpegStatus>({ available: false, message: '正在检测 FFmpeg…' })
 const checkingFfmpeg = ref(true)
+const hardware = ref<SubtitleHardwareStatus | null>(null)
+const hardwareError = ref('')
+const checkingHardware = ref(true)
 const manualLoading = ref('')
 const bufferedEvents = new Map<string, SubtitleBatchSnapshot>()
 const notifiedBatches = new Set<string>()
@@ -69,7 +74,9 @@ const batchProgress = computed(() => {
 })
 const activeItem = computed(() => batch.value?.items.find((item) => item.status === 'running'))
 const retryRows = computed(() => rows.value.filter((row) => ['failed', 'cancelled'].includes(batchItemsByVideo.value.get(row.videoPath)?.status ?? '') && Boolean(row.subtitlePath)))
-const canStart = computed(() => Boolean(scan.value) && readyRows.value.length > 0 && !busy.value && ffmpeg.value.available && offsetSeconds.value !== null)
+const encodingReady = computed(() => embedMode.value === 'soft' || acceleration.value === 'cpu-fast' || (!checkingHardware.value && !hardwareError.value && hardware.value?.qsvAvailable === true))
+const canStart = computed(() => Boolean(scan.value) && readyRows.value.length > 0 && !busy.value && ffmpeg.value.available && offsetSeconds.value !== null && encodingReady.value)
+const hardwareMessage = computed(() => checkingHardware.value ? '正在读取本机硬件并实测 QSV 编码…' : hardwareError.value || hardware.value?.message || '硬件检测尚未完成')
 const reusedSubtitles = computed(() => {
   const counts = new Map<string, number>()
   for (const row of readyRows.value) if (row.subtitlePath) counts.set(row.subtitlePath, (counts.get(row.subtitlePath) ?? 0) + 1)
@@ -89,6 +96,10 @@ const encodingOptions = [
   { label: 'Big5（繁体中文）', value: 'big5' },
   { label: 'Shift_JIS（日文）', value: 'shift_jis' }
 ]
+const resolutionOptions = [
+  { label: '保留原分辨率（默认）', value: 'source' },
+  { label: '1080p 速度模式', value: '1080p' }
+]
 
 watch([search, filter], () => { page.value = 1 })
 watch(() => filteredRows.value.length, (length) => { page.value = Math.min(page.value, Math.max(1, Math.ceil(length / PAGE_SIZE))) })
@@ -98,10 +109,67 @@ function formatError(error: unknown): string { return error instanceof Error ? e
 function confidenceLabel(confidence: SubtitleConfidence | null): string { return confidence ? { high: '匹配可靠', medium: '建议确认', low: '需要确认' }[confidence] : '未匹配' }
 function confidenceType(confidence: SubtitleConfidence | null): 'success' | 'warning' | 'default' { return confidence === 'high' ? 'success' : confidence ? 'warning' : 'default' }
 function operationLabel(mode: SubtitleEmbedMode): string { return mode === 'burn' ? '字幕烧录' : '字幕轨内封' }
-function itemStatusLabel(status: string): string {
+function itemStatusLabel(status: string, phase?: SubtitleProcessingPhase): string {
+  if (status === 'running' && phase === 'finalizing') return '正在整理文件'
+  if (status === 'running' && phase === 'preparing') return '正在准备数据'
+  if (status === 'running' && phase === 'probing') return '正在检测视频'
   const operation = operationLabel(batch.value?.mode ?? embedMode.value)
   return ({ queued: '等待处理', running: `${operation}中`, succeeded: `${operation}完成`, failed: '处理失败', cancelled: '已取消' } as Record<string, string>)[status] ?? status
 }
+function encoderLabel(encoder?: string): string {
+  if (!encoder) return '准备中'
+  if (/qsv/i.test(encoder)) return `Intel QSV · ${encoder}`
+  if (/libx264/i.test(encoder)) return `CPU · ${encoder}`
+  if (/^(?:copy|stream-copy)$/i.test(encoder)) return '音视频直接复制'
+  return encoder
+}
+function decoderLabel(decoder?: string): string {
+  if (!decoder) return '准备中'
+  if (/qsv/i.test(decoder)) return `Intel 硬件解码 · ${decoder}`
+  if (/d3d11va|dxva2/i.test(decoder)) return `硬件解码 · ${decoder}`
+  if (/^(?:cpu|software)$/i.test(decoder)) return 'CPU 软件解码'
+  if (/^(?:copy|none|stream-copy)$/i.test(decoder)) return '直接复制'
+  if (/[（(]CPU[）)]/i.test(decoder)) return `CPU 软件解码 · ${decoder.replace(/\s*[（(]CPU[）)]/i, '')}`
+  return `CPU · ${decoder}`
+}
+function formatDuration(seconds?: number): string {
+  if (seconds === undefined || !Number.isFinite(seconds) || seconds < 0) return '计算中'
+  const total = Math.round(seconds)
+  const hours = Math.floor(total / 3600)
+  const minutes = Math.floor(total % 3600 / 60)
+  const rest = String(total % 60).padStart(2, '0')
+  return hours > 0 ? `${hours}:${String(minutes).padStart(2, '0')}:${rest}` : `${minutes}:${rest}`
+}
+function remainingLabel(item: SubtitleBatchItem): string {
+  if (item.status === 'succeeded') return '已完成'
+  if (item.status === 'cancelled' || item.status === 'failed') return '已停止'
+  if (item.phase === 'finalizing') return '整理中'
+  return formatDuration(item.estimatedRemainingSeconds)
+}
+function telemetryItems(item: SubtitleBatchItem): Array<{ label: string; value: string }> {
+  if (item.status === 'queued') return []
+  if (batch.value?.mode === 'soft') {
+    const details = [
+      { label: '编码', value: encoderLabel(item.actualEncoder) },
+      { label: '解码', value: decoderLabel(item.actualDecoder) },
+      { label: '已用', value: formatDuration(item.elapsedSeconds) },
+      { label: '剩余', value: remainingLabel(item) }
+    ]
+    if (item.outputWidth && item.outputHeight) details.push({ label: '输出', value: `${item.outputWidth}×${item.outputHeight}` })
+    return details
+  }
+  const details = [
+    { label: '编码', value: encoderLabel(item.actualEncoder) },
+    { label: '解码', value: decoderLabel(item.actualDecoder) },
+    { label: 'FPS', value: item.fps !== undefined && Number.isFinite(item.fps) && item.fps > 0 ? item.fps.toFixed(1) : '计算中' },
+    { label: '倍速', value: item.speed !== undefined && Number.isFinite(item.speed) && item.speed > 0 ? `${item.speed.toFixed(2)}x` : '计算中' },
+    { label: '已用', value: formatDuration(item.elapsedSeconds) },
+    { label: '剩余', value: remainingLabel(item) }
+  ]
+  if (item.outputWidth && item.outputHeight) details.push({ label: '输出', value: `${item.outputWidth}×${item.outputHeight}` })
+  return details
+}
+function changeAcceleration(value: SubtitleAcceleration): void { if (!busy.value) acceleration.value = value }
 function changeMode(mode: SubtitleEmbedMode): void {
   if (busy.value || embedMode.value === mode) return
   embedMode.value = mode
@@ -227,12 +295,18 @@ function handleEvent(snapshot: SubtitleBatchSnapshot): void {
   }
   if (batch.value && snapshot.batchId !== batch.value.batchId) return
   batch.value = snapshot
+  if (!scan.value && snapshot.status === 'running') {
+    embedMode.value = snapshot.mode
+    acceleration.value = snapshot.acceleration
+    resolution.value = snapshot.resolution
+    format.value = snapshot.mode === 'burn' ? 'mp4' : 'mkv'
+  }
   if (snapshot.status !== 'running') cancelling.value = false
   notifyFinished(snapshot)
 }
 
 async function startBatch(onlyRetry = false): Promise<void> {
-  if (!scan.value || busy.value || !ffmpeg.value.available) return
+  if (!scan.value || busy.value || !ffmpeg.value.available || !encodingReady.value) return
   const targets = onlyRetry ? retryRows.value : readyRows.value
   if (!targets.length || offsetSeconds.value === null) return
   starting.value = true
@@ -243,6 +317,8 @@ async function startBatch(onlyRetry = false): Promise<void> {
       scanId: scan.value.scanId,
       items: targets.map((row) => ({ rowId: row.id, subtitlePath: row.subtitlePath! })),
       mode: embedMode.value,
+      acceleration: acceleration.value,
+      resolution: embedMode.value === 'burn' ? resolution.value : 'source',
       format: embedMode.value === 'burn' ? 'mp4' : format.value,
       encoding: encoding.value,
       offsetSeconds: offsetSeconds.value
@@ -270,6 +346,14 @@ async function refreshFfmpeg(): Promise<void> {
   catch (error) { ffmpeg.value = { available: false, message: formatError(error) } }
   finally { checkingFfmpeg.value = false }
 }
+async function refreshHardware(force = false): Promise<void> {
+  if (force && (busy.value || checkingHardware.value)) return
+  checkingHardware.value = true
+  hardwareError.value = ''
+  try { hardware.value = await window.electronApi.subtitles.hardwareStatus(force) }
+  catch (error) { hardwareError.value = formatError(error) }
+  finally { checkingHardware.value = false }
+}
 
 onMounted(() => {
   unsubscribe = window.electronApi.subtitles.onEvent(handleEvent)
@@ -280,10 +364,13 @@ onMounted(() => {
     if (snapshot.status === 'running') {
       embedMode.value = snapshot.mode
       format.value = snapshot.mode === 'burn' ? 'mp4' : 'mkv'
+      acceleration.value = snapshot.acceleration
+      resolution.value = snapshot.resolution
     }
     if (snapshot.status !== 'running') notifiedBatches.add(snapshot.batchId)
   }).catch((error: unknown) => { errorText.value = formatError(error) })
   void refreshFfmpeg()
+  void refreshHardware()
 })
 onUnmounted(() => unsubscribe?.())
 </script>
@@ -330,8 +417,9 @@ onUnmounted(() => unsubscribe?.())
                   <div v-if="batchItemsByVideo.has(row.videoPath)" data-testid="subtitle-batch-item" :data-status="batchItemsByVideo.get(row.videoPath)!.status" class="row-result" :class="`result-${batchItemsByVideo.get(row.videoPath)!.status}`">
                     <NProgress v-if="batchItemsByVideo.get(row.videoPath)!.status === 'running'" type="line" :percentage="Math.round(batchItemsByVideo.get(row.videoPath)!.progress * 100)" :show-indicator="false" :processing="true" />
                     <CircleCheck v-if="batchItemsByVideo.get(row.videoPath)!.status === 'succeeded'" :size="14" />
-                    <span :title="batchItemsByVideo.get(row.videoPath)!.error || batchItemsByVideo.get(row.videoPath)!.message">{{ itemStatusLabel(batchItemsByVideo.get(row.videoPath)!.status) }}{{ batchItemsByVideo.get(row.videoPath)!.error ? `：${batchItemsByVideo.get(row.videoPath)!.error}` : '' }}</span>
+                    <span :title="batchItemsByVideo.get(row.videoPath)!.error || batchItemsByVideo.get(row.videoPath)!.message">{{ itemStatusLabel(batchItemsByVideo.get(row.videoPath)!.status, batchItemsByVideo.get(row.videoPath)!.phase) }}{{ batchItemsByVideo.get(row.videoPath)!.error ? `：${batchItemsByVideo.get(row.videoPath)!.error}` : '' }}</span>
                   </div>
+                  <div v-if="batchItemsByVideo.has(row.videoPath) && batchItemsByVideo.get(row.videoPath)!.status !== 'queued'" data-testid="subtitle-item-telemetry" :data-encoder="batchItemsByVideo.get(row.videoPath)!.actualEncoder" :data-decoder="batchItemsByVideo.get(row.videoPath)!.actualDecoder" :data-phase="batchItemsByVideo.get(row.videoPath)!.phase" class="row-telemetry"><span v-for="metric in telemetryItems(batchItemsByVideo.get(row.videoPath)!)" :key="metric.label" :title="`${metric.label}：${metric.value}`"><small>{{ metric.label }}</small><strong>{{ metric.value }}</strong></span></div>
                 </div>
               </article>
               <div v-if="!pageRows.length" class="list-empty"><Search :size="30" /><strong>{{ rows.length ? '没有符合条件的视频' : '当前目录没有视频' }}</strong><span>{{ rows.length ? '调整搜索或筛选条件即可查看其他视频' : '支持 MP4、MKV、AVI、MOV、TS 等常见视频格式' }}</span></div>
@@ -349,10 +437,11 @@ onUnmounted(() => unsubscribe?.())
 
           <template v-if="batch">
             <section class="batch-panel" :class="{ 'batch-restored': !scan }" aria-live="polite">
-              <div class="batch-heading"><div><strong>{{ operationLabel(batch.mode) }}{{ batch.status === 'running' ? '中' : batch.status === 'cancelled' ? '已停止' : '已结束' }}</strong><span>{{ batchCounts.finished }}/{{ batchCounts.total }} 个视频</span></div><NButton v-if="batch.status === 'running'" data-testid="subtitle-cancel" size="small" type="error" secondary :loading="cancelling" @click="cancelBatch"><template #icon><NIcon :component="Ban" /></template>{{ cancelling ? '正在停止' : '停止处理' }}</NButton><NButton v-else size="small" secondary @click="openOutput"><template #icon><NIcon :component="FolderOpen" /></template>打开输出</NButton></div>
+              <div class="batch-heading"><div><strong>{{ activeItem?.phase === 'finalizing' ? '正在整理文件' : `${operationLabel(batch.mode)}${batch.status === 'running' ? '中' : batch.status === 'cancelled' ? '已停止' : '已结束'}` }}</strong><span>{{ batchCounts.finished }}/{{ batchCounts.total }} 个视频</span></div><NButton v-if="batch.status === 'running'" data-testid="subtitle-cancel" size="small" type="error" secondary :loading="cancelling" @click="cancelBatch"><template #icon><NIcon :component="Ban" /></template>{{ cancelling ? '正在停止' : '停止处理' }}</NButton><NButton v-else size="small" secondary @click="openOutput"><template #icon><NIcon :component="FolderOpen" /></template>打开输出</NButton></div>
               <NProgress type="line" :percentage="batchProgress" :processing="batch.status === 'running'" :status="batch.status === 'running' ? 'default' : batchCounts.failed ? 'warning' : batch.status === 'cancelled' ? 'default' : 'success'" />
               <div class="batch-summary"><span class="success-count">完成 {{ batchCounts.succeeded }}</span><span :class="{ 'failure-count': batchCounts.failed }">失败 {{ batchCounts.failed }}</span><span>取消 {{ batchCounts.cancelled }}</span><span v-if="activeItem" class="active-file" :title="activeItem.videoName">{{ activeItem.videoName }} · {{ Math.round(activeItem.progress * 100) }}%</span></div>
-              <div v-if="!scan" class="restored-queue"><article v-for="item in batch.items" :key="item.id" data-testid="subtitle-batch-item" :data-status="item.status" :class="`result-${item.status}`"><div><strong :title="item.videoPath">{{ item.videoName }}</strong><span :title="item.error || item.message">{{ item.error || item.message }}</span></div><NTag size="small" :type="item.status === 'succeeded' ? 'success' : item.status === 'failed' ? 'error' : 'default'">{{ itemStatusLabel(item.status) }}</NTag></article></div>
+              <div v-if="activeItem && scan" class="active-telemetry" aria-label="当前视频处理速度"><span>{{ encoderLabel(activeItem.actualEncoder) }}</span><template v-if="batch.mode === 'burn'"><span>{{ activeItem.fps !== undefined && Number.isFinite(activeItem.fps) && activeItem.fps > 0 ? `${activeItem.fps.toFixed(1)} FPS` : 'FPS 计算中' }}</span><span>{{ activeItem.speed !== undefined && Number.isFinite(activeItem.speed) && activeItem.speed > 0 ? `${activeItem.speed.toFixed(2)}x` : '倍速计算中' }}</span></template><span>剩余 {{ remainingLabel(activeItem) }}</span></div>
+              <div v-if="!scan" class="restored-queue"><article v-for="item in batch.items" :key="item.id" data-testid="subtitle-batch-item" :data-status="item.status" :class="`result-${item.status}`"><div><strong :title="item.videoPath">{{ item.videoName }}</strong><span :title="item.error || item.message">{{ item.error || item.message }}</span><div v-if="item.status !== 'queued'" data-testid="subtitle-item-telemetry" :data-encoder="item.actualEncoder" :data-decoder="item.actualDecoder" :data-phase="item.phase" class="row-telemetry"><span v-for="metric in telemetryItems(item)" :key="metric.label"><small>{{ metric.label }}</small><strong>{{ metric.value }}</strong></span></div></div><NTag size="small" :type="item.status === 'succeeded' ? 'success' : item.status === 'failed' ? 'error' : 'default'">{{ itemStatusLabel(item.status, item.phase) }}</NTag></article></div>
               <p v-if="!scan" class="restore-note">已恢复最近一次任务。处理结束后，可重新选择来源继续操作。</p>
             </section>
           </template>
@@ -361,17 +450,23 @@ onUnmounted(() => unsubscribe?.())
         <aside class="output-panel">
           <div class="settings-title"><Subtitles :size="20" /><h2>字幕处理设置</h2></div>
           <div class="settings-scroll">
+          <section data-testid="subtitle-hardware-status" :data-qsv-available="hardware?.qsvAvailable ?? false" :data-checking="checkingHardware" class="hardware-card"><div class="hardware-heading"><strong>{{ hardware?.gpuName || (checkingHardware ? '正在读取本机硬件' : '本机硬件检测') }}</strong><NTooltip><template #trigger><NButton quaternary circle size="tiny" :disabled="busy || checkingHardware" :loading="checkingHardware" aria-label="重新检测本机硬件加速" @click="refreshHardware(true)"><template #icon><NIcon :component="RefreshCw" /></template></NButton></template>重新检测本机设备与 QSV 硬件编码</NTooltip></div><span v-if="hardware?.cpuName" class="hardware-device">{{ hardware.cpuName }}</span><span v-if="hardware?.driverVersion" class="hardware-device">显卡驱动 {{ hardware.driverVersion }}</span><NTag size="tiny" :type="checkingHardware ? 'default' : hardware?.qsvAvailable && !hardwareError ? 'success' : 'warning'">{{ checkingHardware ? '正在检测硬件加速' : hardware?.qsvAvailable && !hardwareError ? 'Intel QSV 已就绪' : 'QSV 尚不可用' }}</NTag><p :class="{ 'hardware-warning': !checkingHardware && (!hardware?.qsvAvailable || hardwareError) }">{{ hardwareMessage }}</p></section>
           <div class="setting-section mode-section"><label class="setting-label">字幕处理方式</label><div class="mode-choices"><button data-testid="subtitle-mode-burn" :class="{ active: embedMode === 'burn' }" :disabled="busy" :aria-pressed="embedMode === 'burn'" @click="changeMode('burn')"><div><strong>烧录到画面</strong><span>推荐</span></div><small>跨设备播放，字幕直接可见</small></button><button data-testid="subtitle-mode-soft" :class="{ active: embedMode === 'soft' }" :disabled="busy" :aria-pressed="embedMode === 'soft'" @click="changeMode('soft')"><div><strong>内置字幕轨</strong><span>可开关</span></div><small>需要播放器支持并开启字幕轨</small></button></div><p class="setting-description mode-description">{{ embedMode === 'burn' ? '字幕成为画面的一部分，复制视频到手机、电视等设备也能直接显示；无法关闭字幕。视频会重新编码，耗时更长。' : '字幕存入视频文件无需外挂，但播放器需要支持并开启字幕轨。视频与音频直接复制，处理更快。' }}</p></div>
           <div class="preserve-note"><ShieldCheck :size="19" /><div><strong>原文件完整保留</strong><span>原视频和外挂字幕均不修改。<br>处理结果另存到专属输出文件夹。</span></div></div>
-          <div v-if="embedMode === 'burn'" class="setting-section"><label class="setting-label">输出格式</label><div class="burn-format"><strong>MP4</strong><NTag size="small">H.264 / AAC</NTag></div><p class="setting-description">使用常见的兼容格式。字幕已写入画面，播放时无需加载或开启字幕轨。</p></div>
+          <template v-if="embedMode === 'burn'">
+            <div class="setting-section"><label class="setting-label">编码方式</label><div class="mode-choices"><button data-testid="subtitle-acceleration-auto" :class="{ active: acceleration === 'auto' }" :disabled="busy" :aria-pressed="acceleration === 'auto'" @click="changeAcceleration('auto')"><div><strong>自动硬件加速</strong><span>推荐</span></div><small>使用本机已通过实际检测的 Intel QSV</small></button><button data-testid="subtitle-acceleration-cpu-fast" :class="{ active: acceleration === 'cpu-fast' }" :disabled="busy" :aria-pressed="acceleration === 'cpu-fast'" @click="changeAcceleration('cpu-fast')"><div><strong>CPU 快速编码</strong><span>veryfast</span></div><small>明确使用 CPU，速度仍取决于分辨率</small></button></div><p class="setting-description">{{ acceleration === 'cpu-fast' ? '使用 CPU 的 veryfast 编码预设，比原先的 medium 更快。4K 仍需处理大量像素，实际速度见运行进度。' : '根据本机实际检测结果启用硬件解码与编码。加速不可用时会提示原因，不会自动切换为 CPU 编码。' }}</p></div>
+            <div class="setting-section"><label class="setting-label" for="subtitle-resolution">输出分辨率</label><NSelect id="subtitle-resolution" v-model:value="resolution" data-testid="subtitle-resolution" :data-resolution="resolution" aria-label="输出分辨率" :options="resolutionOptions" :disabled="busy" size="small" /><p class="setting-description" :class="{ 'resolution-note': resolution === '1080p' }">{{ resolution === 'source' ? '保留原始宽高，4K 视频默认仍输出 4K；不会为了提速自动缩小画面。' : '主动降低到最高 1080p，可减少编码量；保留画面比例，较小视频不会放大。' }}</p></div>
+            <div class="setting-section"><label class="setting-label">输出格式</label><div class="burn-format"><strong>MP4</strong><NTag size="small">H.264 / AAC · 8-bit</NTag></div><p class="setting-description">烧录视频输出为 8-bit，即使源视频为 10-bit 也会转换。字幕已写入画面，播放时无需开启字幕轨。</p></div>
+          </template>
           <div v-else class="setting-section"><label class="setting-label">输出格式</label><div class="format-choices"><button :class="{ active: format === 'mkv' }" :disabled="busy" :aria-pressed="format === 'mkv'" @click="format = 'mkv'"><strong>MKV</strong><span>推荐</span></button><button :class="{ active: format === 'mp4' }" :disabled="busy" :aria-pressed="format === 'mp4'" @click="format = 'mp4'"><strong>MP4</strong><span>文本字幕</span></button></div><p class="setting-description">{{ format === 'mkv' ? '保留 ASS / SSA 字幕样式，更适合多音轨、特效字幕和原片收藏。' : '字幕转换为文本轨，部分样式会简化；原视频或音频编码不兼容 MP4 时会提示失败，可改用 MKV。' }}</p></div>
           <div class="setting-section destination-section"><label class="setting-label"><FolderOpen :size="15" />输出位置</label><div data-testid="subtitle-output" class="destination" :title="batch?.outputDirectory || scan?.outputDirectory"><strong>{{ scan || batch ? fileName(batch?.outputDirectory || scan!.outputDirectory) : '内嵌字幕处理+原目录名称' }}</strong><span>{{ batch?.outputDirectory || scan?.outputDirectory || '在视频所在目录下自动新建' }}</span></div><p class="setting-description">新视频集中放入此文件夹。已有同名文件会自动编号，避免覆盖。</p></div>
           <details class="advanced-settings"><summary><span>高级选项</span><span>编码 · 时间偏移</span></summary><div><label class="setting-label" for="subtitle-encoding">字幕编码</label><NSelect id="subtitle-encoding" v-model:value="encoding" :options="encodingOptions" :disabled="busy" size="small" /><p class="setting-description">通常保持自动；字幕出现乱码时可指定原文件的编码。</p><label class="setting-label" for="subtitle-offset">字幕时间偏移（秒）</label><NInputNumber id="subtitle-offset" v-model:value="offsetSeconds" :min="-3600" :max="3600" :precision="3" :step="0.5" :disabled="busy" size="small" placeholder="0" /><p class="setting-description">正数让字幕延后，负数让字幕提前。只影响输出视频。</p></div></details>
           </div>
           <div class="run-area">
+            <div v-if="embedMode === 'burn' && acceleration === 'auto' && !encodingReady && !running" class="acceleration-warning"><span>{{ checkingHardware ? '正在验证硬件加速，可先选择视频并确认字幕。' : '自动加速当前不可用。请查看检测原因，或明确选择 CPU 快速编码后开始。' }}</span><NButton v-if="!checkingHardware" size="tiny" secondary :disabled="busy" @click="changeAcceleration('cpu-fast')">使用 CPU 快速编码</NButton></div>
             <template v-if="scan"><div class="ready-summary"><ListChecks :size="19" /><span>将处理 <strong>{{ readyRows.length }}</strong> 个视频</span></div><p v-if="unmatchedCount" class="run-warning">{{ unmatchedCount }} 个已勾选视频没有字幕，将跳过。可在左侧手动指定。</p><p v-if="reviewCount" class="run-warning">{{ reviewCount }} 项匹配需要确认，请检查字幕是否对应。</p><p v-if="reusedSubtitles.size" class="run-warning">存在字幕重复使用，请确认是否为同一内容。</p></template>
             <NButton data-testid="subtitle-start" type="primary" size="large" block :disabled="!canStart" :loading="starting" @click="startBatch()"><template #icon><NIcon :component="Play" /></template>{{ starting ? '正在启动' : running ? `${operationLabel(batch?.mode ?? embedMode)}中…` : embedMode === 'burn' ? '开始烧录字幕' : '开始内封字幕轨' }}</NButton>
-            <NButton v-if="retryRows.length && !running" block secondary :disabled="busy || !ffmpeg.available" @click="startBatch(true)"><template #icon><NIcon :component="RotateCcw" /></template>重试失败 / 取消项（{{ retryRows.length }}）</NButton>
+            <NButton v-if="retryRows.length && !running" block secondary :disabled="busy || !ffmpeg.available || !encodingReady" @click="startBatch(true)"><template #icon><NIcon :component="RotateCcw" /></template>重试失败 / 取消项（{{ retryRows.length }}）</NButton>
             <NButton v-if="batch && batch.status === 'running'" block secondary @click="openOutput"><template #icon><NIcon :component="FolderOpen" /></template>打开输出目录</NButton>
             <div v-if="!ffmpeg.available && !checkingFfmpeg" class="ffmpeg-warning"><span>{{ ffmpeg.message }}</span><NButton size="tiny" secondary :loading="checkingFfmpeg" @click="refreshFfmpeg">重新检测</NButton></div>
             <p class="run-footnote">{{ running ? '可以切换其他页签，任务会继续。停止时保留已完成的视频。' : 'SRT · ASS · SSA · VTT / 自动匹配后可手动调整' }}</p>
@@ -421,6 +516,10 @@ onUnmounted(() => unsubscribe?.())
 .row-result { display: flex; align-items: center; min-width: 0; gap: 6px; padding-left: 22px; font-size: var(--ui-font-sm); color: var(--text-muted); }
 .row-result > .n-progress { flex: 1; max-width: 170px; }
 .row-result > span { overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.row-telemetry { display: flex; flex-wrap: wrap; gap: 5px 12px; padding-left: 22px; font-size: var(--ui-font-xs); }
+.row-telemetry > span { display: inline-flex; align-items: baseline; gap: 5px; min-width: 0; max-width: 100%; }
+.row-telemetry small { color: var(--text-muted); font-size: inherit; flex-shrink: 0; }
+.row-telemetry strong { min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; color: var(--text-color); font-size: inherit; font-weight: 500; }
 .result-succeeded { color: var(--success-color); }
 .result-failed { color: var(--error-color); }
 .list-footer { display: flex; align-items: center; justify-content: space-between; gap: 8px; min-height: 27px; font-size: var(--ui-font-sm); color: var(--text-muted); }
@@ -449,6 +548,12 @@ onUnmounted(() => unsubscribe?.())
 .settings-title { display: flex; align-items: center; gap: 8px; }
 .settings-title > svg { color: var(--accent-color); }
 .settings-title h2 { margin: 0; font-size: var(--ui-font-lg); }
+.hardware-card { display: flex; flex-direction: column; align-items: flex-start; gap: 6px; padding: 10px 11px; border: 1px solid var(--row-divider); border-radius: 7px; background: var(--surface-muted); }
+.hardware-heading { display: flex; align-items: center; justify-content: space-between; gap: 5px; width: 100%; }
+.hardware-heading > strong { min-width: 0; font-size: var(--ui-font-sm); overflow-wrap: anywhere; }
+.hardware-device { color: var(--text-muted); font-size: var(--ui-font-xs); overflow-wrap: anywhere; }
+.hardware-card p { margin: 0; color: var(--text-muted); font-size: var(--ui-font-xs); line-height: 1.6; overflow-wrap: anywhere; }
+.hardware-card .hardware-warning { color: var(--warning-color); }
 .preserve-note { display: flex; align-items: flex-start; gap: 9px; padding: 12px 11px; border-radius: 7px; background: var(--surface-muted); }
 .preserve-note > svg { flex-shrink: 0; margin-top: 1px; color: var(--success-color); }
 .preserve-note > div { display: flex; flex-direction: column; gap: 5px; }
@@ -471,6 +576,7 @@ onUnmounted(() => unsubscribe?.())
 .format-choices > button > span { color: var(--text-muted); font-size: var(--ui-font-xs); }
 .format-choices > button:disabled { cursor: default; }
 .setting-description { margin: 0; color: var(--text-muted); font-size: var(--ui-font-sm); line-height: 1.65; }
+.setting-description.resolution-note { color: var(--warning-color); }
 .destination { display: flex; flex-direction: column; gap: 6px; padding: 11px; border: 1px dashed var(--border-color); border-radius: 6px; background: var(--surface-muted); overflow-wrap: anywhere; }
 .destination strong { font-size: var(--ui-font-sm); font-weight: 600; }
 .destination > span { color: var(--text-muted); font-size: var(--ui-font-xs); line-height: 1.55; }
@@ -487,6 +593,7 @@ onUnmounted(() => unsubscribe?.())
 .ready-summary > svg { color: var(--accent-color); }
 .ready-summary strong { color: var(--accent-color); font-size: var(--ui-font-lg); }
 .run-warning { margin: 0; color: var(--warning-color); font-size: var(--ui-font-sm); line-height: 1.6; }
+.acceleration-warning { display: flex; flex-direction: column; align-items: flex-start; gap: 7px; color: var(--warning-color); font-size: var(--ui-font-sm); line-height: 1.6; }
 .run-footnote { margin: 0; color: var(--text-muted); font-size: var(--ui-font-xs); line-height: 1.6; text-align: center; }
 .ffmpeg-warning { display: flex; flex-direction: column; align-items: flex-start; gap: 7px; font-size: var(--ui-font-sm); color: var(--error-color); overflow-wrap: anywhere; }
 .batch-panel { display: flex; flex-direction: column; gap: 8px; padding: 12px; border: 1px solid var(--row-divider); border-radius: 7px; background: var(--surface-muted); }
@@ -494,17 +601,20 @@ onUnmounted(() => unsubscribe?.())
 .success-count { color: var(--success-color); }
 .failure-count { color: var(--error-color); }
 .active-file { flex: 1; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; text-align: right; }
+.active-telemetry { display: flex; flex-wrap: wrap; gap: 4px 12px; color: var(--text-muted); font-size: var(--ui-font-xs); }
 .batch-restored { flex: 1; min-height: 0; }
 .restored-queue { display: flex; flex: 1; flex-direction: column; min-height: 100px; overflow-y: auto; border-top: 1px solid var(--row-divider); }
 .restored-queue > article { display: flex; align-items: center; gap: 10px; padding: 12px 0; border-bottom: 1px solid var(--row-divider); }
 .restored-queue > article > div { display: flex; flex: 1; flex-direction: column; min-width: 0; gap: 3px; }
 .restored-queue strong, .restored-queue span { overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
 .restored-queue > article > div > span { font-size: var(--ui-font-sm); }
+.restored-queue .row-telemetry { padding-left: 0; padding-top: 5px; }
 .restore-note { margin: 0; color: var(--text-muted); font-size: var(--ui-font-sm); }
 .drop-overlay { position: absolute; inset: 0; z-index: 20; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 14px; border: 2px dashed var(--accent-color); border-radius: 9px; color: var(--accent-color); background: color-mix(in srgb, var(--surface-color) 94%, transparent); pointer-events: none; }
 .drop-overlay strong { font-size: var(--ui-font-xxl); }
 .drop-overlay span { color: var(--text-muted); }
 @media (max-width: 1150px) { .workspace-columns { grid-template-columns: minmax(0, 1fr) 260px; gap: 12px; } .output-panel { padding-left: 12px; } .reuse-warning { display: none; } .scope-note { display: none; } }
+@media (max-height: 740px) and (min-width: 931px) { .matching-panel { gap: 6px; } .source-bar { padding: 8px 10px; } .match-list { min-height: 60px; } .batch-panel { gap: 6px; padding: 9px 10px; } .list-footer { min-height: 25px; } }
 @media (max-width: 930px) { .workspace-columns { display: flex; flex-direction: column; overflow-y: auto; min-height: 0; } .matching-panel { min-height: 440px; flex-shrink: 0; } .output-panel { min-height: auto; overflow: visible; border-left: 0; border-top: 1px solid var(--row-divider); padding: 18px 2px 4px; gap: 16px; } .settings-scroll { display: grid; flex: none; grid-template-columns: 1fr 1fr; overflow: visible; gap: 16px; } .preserve-note { grid-column: 1 / -1; } .welcome-state { min-height: 460px; } .match-list { max-height: 500px; } .manual-label { display: none; } }
 @media (max-width: 650px) { .source-choices { grid-template-columns: 1fr; } .settings-scroll { display: flex; } .selection-toolbar { flex-wrap: wrap; } .match-explanation { flex-wrap: wrap; } .match-explanation > span:not(.n-tag) { max-width: 100%; } .welcome-steps { gap: 8px; } }
 </style>

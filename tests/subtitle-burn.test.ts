@@ -147,6 +147,20 @@ describe.skipIf(!existsSync(executable) || !existsSync(bundledFont))('真实字�
     await writeFile(join(evidenceRoot, 'report.json'), JSON.stringify({ mode: complete.mode, isolatedVideo: moved, noExternalFiles: await readdir(videoOnly), originalPathsUnavailable: true, before, during, after, codecs: 'H264 / AAC', subtitleStreams: 0, decodedWithSn: true, metadata }, null, 2))
   }, 30_000)
 
+  it('CPU 快速模式用四个编码线程并正确烧录中文字幕', async () => {
+    const test = await fixture()
+    const sourceHashes = [digest(await readFile(test.video)), digest(await readFile(test.subtitle))]
+    const started = await test.subject.start(request(test.scan, { acceleration: 'cpu-fast' }), owner(test.fake))
+    const complete = await waitDone(test.subject, test.fake, started.batchId)
+    expect(complete.items[0].error).toBeUndefined()
+    expect(complete.items[0].status).toBe('succeeded')
+    expect(complete.acceleration).toBe('cpu-fast')
+    expect(complete.items[0]).toMatchObject({ actualEncoder: 'libx264', actualDecoder: 'h264（CPU）', outputWidth: WIDTH, outputHeight: HEIGHT })
+    expect(countCaptionPixels(complete.items[0].outputPath, 1).white).toBeGreaterThan(100)
+    expect(probe(complete.items[0].outputPath)).not.toContain('Subtitle:')
+    expect([digest(await readFile(test.video)), digest(await readFile(test.subtitle))]).toEqual(sourceHashes)
+  }, 30_000)
+
   it('ASS 中文字的颜色和样式保留在画面里', async () => {
     const ass = '[Script Info]\nScriptType: v4.00+\nPlayResX: 640\nPlayResY: 360\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: RedChinese,Noto Sans SC,30,&H000000FF,&H000000FF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,2,1,2,20,20,24,1\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.60,0:00:01.60,RedChinese,,0,0,0,,红色样式中文字幕\n'
     const test = await fixture(ass, 'ass')

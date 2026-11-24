@@ -4,6 +4,7 @@ import { SubtitleService } from '../services/subtitle-service'
 
 /** 外挂字幕工具使用独立白名单 IPC，处理路径绑定创建会话的页面。 */
 export function registerSubtitleIpc(service: SubtitleService): void {
+  ipcMain.handle('subtitle:hardware-status', (_event, force?: boolean) => service.hardwareStatus(force === true))
   ipcMain.handle('subtitle:select-folder', async (event) => {
     const result = await dialog.showOpenDialog({ title: '选择视频和外挂字幕所在的文件夹', properties: ['openDirectory'] })
     return result.canceled || !result.filePaths[0] ? null : service.scanPath(result.filePaths[0], event.sender)

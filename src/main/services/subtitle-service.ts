@@ -8,15 +8,16 @@ import { TextDecoder } from 'node:util'
 import { pipeline } from 'node:stream/promises'
 import type { WebContents } from 'electron'
 import iconv from 'iconv-lite'
-import { parseFfmpegProgress } from '../../shared/ffmpeg-helpers'
 import type { FfmpegStatus } from '../../shared/media-api'
 import {
   SUBTITLE_EXTENSIONS, SUBTITLE_VIDEO_EXTENSIONS,
   type SubtitleBatchItem, type SubtitleBatchRequest, type SubtitleBatchSnapshot,
-  type SubtitleCandidate, type SubtitleEncoding, type SubtitleScanResult
+  type SubtitleCandidate, type SubtitleEncoding, type SubtitleHardwareStatus, type SubtitleScanResult
 } from '../../shared/subtitle-api'
 import { matchSubtitles } from '../../shared/subtitle-matching'
 import { shiftSubtitleTimestamps } from '../../shared/subtitle-timing'
+import { estimateSubtitleRemaining, SubtitleProgressReader } from '../../shared/subtitle-progress'
+import { buildSubtitleEncodingArgs, parseSubtitleSourceInfo, SubtitleEncodingService, type SubtitleEncodingPlan } from './subtitle-encoding-service'
 
 const VIDEO_TYPES = new Set<string>(SUBTITLE_VIDEO_EXTENSIONS)
 const SUBTITLE_TYPES = new Set<string>(SUBTITLE_EXTENSIONS)
@@ -46,7 +47,14 @@ export class SubtitleService {
   private readonly lockedOwners = new Set<number>()
   private readonly watchedOwners = new Set<number>()
 
-  constructor(private readonly ffmpeg: { status(): Promise<FfmpegStatus> }, private readonly fontDirectory?: string) {}
+  constructor(private readonly ffmpeg: { status(): Promise<FfmpegStatus> }, private readonly fontDirectory?: string, private readonly encoders = new SubtitleEncodingService()) {}
+
+  async hardwareStatus(force = false): Promise<SubtitleHardwareStatus> {
+    if (typeof force !== 'boolean') throw new Error('硬件检测参数无效')
+    const status = await this.ffmpeg.status()
+    if (!status.available || !status.path) throw new Error(status.message)
+    return this.encoders.hardwareStatus(status.path, force)
+  }
 
   /** 只扫描选中目录的一层；选中单个视频时仍从其同目录匹配字幕。 */
   async scanPath(inputPath: string, owner: WebContents): Promise<SubtitleScanResult> {
@@ -121,11 +129,13 @@ export class SubtitleService {
       }
       const snapshot: SubtitleBatchSnapshot = {
         batchId: randomUUID(), outputDirectory: scan.result.outputDirectory,
-        mode: request.mode ?? 'burn', status: 'running', items, startedAt: new Date().toISOString()
+        mode: request.mode ?? 'burn', acceleration: request.acceleration ?? 'auto',
+        resolution: request.mode === 'soft' ? 'source' : request.resolution ?? 'source',
+        status: 'running', items, startedAt: new Date().toISOString()
       }
       let resolveDone!: () => void
       const done = new Promise<void>((resolveResult) => { resolveDone = resolveResult })
-      const batch: BatchContext = { snapshot, owner, request: { ...structuredClone(request), mode: snapshot.mode }, executable: ffmpeg.path, cancelled: false, done }
+      const batch: BatchContext = { snapshot, owner, request: { ...structuredClone(request), mode: snapshot.mode, acceleration: snapshot.acceleration, resolution: snapshot.resolution }, executable: ffmpeg.path, cancelled: false, done }
       this.batches.set(snapshot.batchId, batch)
       this.watchOwner(owner)
       setImmediate(() => {
@@ -173,10 +183,10 @@ export class SubtitleService {
   /** 主进程在退出前等待此 Promise，确保子进程退出与半成品清理完成。 */
   async stopAll(): Promise<void> {
     for (const batch of this.batches.values()) this.cancelContext(batch)
-    await Promise.allSettled([...this.batches.values()].map((batch) => batch.done))
+    await Promise.allSettled([this.encoders.stopAll(), ...[...this.batches.values()].map((batch) => batch.done)])
   }
 
-  hasRunning(): boolean { return [...this.batches.values()].some((batch) => batch.snapshot.status === 'running') }
+  hasRunning(): boolean { return this.encoders.hasRunning() || [...this.batches.values()].some((batch) => batch.snapshot.status === 'running') }
 
   private async runBatch(batch: BatchContext): Promise<void> {
     for (const item of batch.snapshot.items) {
@@ -192,9 +202,11 @@ export class SubtitleService {
         await this.processItem(batch, item)
         item.status = 'succeeded'
         item.progress = 1
+        item.estimatedRemainingSeconds = 0
         item.message = batch.snapshot.mode === 'burn' ? '字幕已烧录到画面，成品可独立播放' : '字幕轨已嵌入，音视频保持原画质'
       } catch (error) {
         item.status = batch.cancelled ? 'cancelled' : 'failed'
+        item.estimatedRemainingSeconds = undefined
         item.error = batch.cancelled ? undefined : errorMessage(error)
         item.message = batch.cancelled ? '已取消，半成品已清理' : '处理失败，继续下一项'
       }
@@ -206,7 +218,21 @@ export class SubtitleService {
   }
 
   private async processItem(batch: BatchContext, item: SubtitleBatchItem): Promise<void> {
+    const startedAt = Date.now()
+    item.phase = 'preparing'
+    item.elapsedSeconds = 0
     const temporaryDirectory = await mkdtemp(join(tmpdir(), 'dev-toolbox-subtitle-'))
+    let lastProgressAt: number | undefined
+    const timer = setInterval(() => {
+      item.elapsedSeconds = Math.max(0, (Date.now() - startedAt) / 1000)
+      if (!batch.cancelled && item.phase === 'encoding' && lastProgressAt !== undefined && Date.now() - lastProgressAt > 5000) {
+        item.fps = undefined
+        item.speed = undefined
+        item.estimatedRemainingSeconds = undefined
+        item.message = '编码处理中，暂未收到新的进度'
+      }
+      if (item.status === 'running') this.emit(batch)
+    }, 1000)
     const partialPath = join(batch.snapshot.outputDirectory, `.subtitle-${randomUUID()}.partial.${batch.request.format}`)
     try {
       this.assertNotCancelled(batch)
@@ -222,33 +248,87 @@ export class SubtitleService {
       const probe = await this.execute(batch, ['-hide_banner', '-nostdin', '-i', item.videoPath], 30_000)
       this.assertNotCancelled(batch)
       const metadata = parseSubtitleVideoProbe(probe.stderr)
+      const source = parseSubtitleSourceInfo(probe.stderr)
       if (!metadata.hasVideo) throw new Error(`无法读取视频流：${probe.stderr.slice(-1400)}`)
+      if (source.width > 0) item.sourceWidth = source.width
+      if (source.height > 0) item.sourceHeight = source.height
       const burning = batch.snapshot.mode === 'burn'
-      if (burning) await this.prepareBurnFonts(batch, temporaryDirectory)
+      let plan: SubtitleEncodingPlan | undefined
+      if (burning) {
+        await this.prepareBurnFonts(batch, temporaryDirectory, item.videoPath)
+        item.phase = batch.snapshot.acceleration === 'auto' ? 'probing' : 'preparing'
+        item.message = batch.snapshot.acceleration === 'auto' ? '正在预检 Intel QSV 硬件解码与字幕烧录' : '准备 CPU 快速编码（veryfast，4 个编码线程）'
+        this.emit(batch)
+        plan = await this.encoders.select(batch.executable, source, batch.snapshot.acceleration, {
+          inputPath: item.videoPath, subtitleName: basename(subtitlePath), resolution: batch.snapshot.resolution,
+          probe: async (args) => {
+            this.assertNotCancelled(batch)
+            const result = await this.execute(batch, args, 20_000, undefined, temporaryDirectory)
+            this.assertNotCancelled(batch)
+            return result
+          }
+        })
+        item.actualEncoder = plan.encoder
+        item.actualDecoder = plan.decoder
+        item.outputWidth = plan.outputWidth
+        item.outputHeight = plan.outputHeight
+      } else {
+        item.actualEncoder = 'copy'
+        item.actualDecoder = 'copy'
+        item.outputWidth = item.sourceWidth
+        item.outputHeight = item.sourceHeight
+      }
       this.assertNotCancelled(batch)
+      item.phase = 'encoding'
       item.message = burning ? '正在烧录字幕（重新编码视频）' : '正在封装字幕（复制音视频流）'
-      item.progress = 0.02
+      item.progress = 0
       this.emit(batch)
       const args = burning
-        ? buildSubtitleBurnArgs(item.videoPath, basename(subtitlePath), partialPath, batch.request.format)
+        ? buildSubtitleEncodingArgs(item.videoPath, basename(subtitlePath), partialPath, batch.request.format, plan!, source)
         : buildSubtitleMuxArgs(item.videoPath, subtitlePath, partialPath, { ...batch.request, offsetSeconds: 0 }, metadata.subtitleCount, item.subtitleName, metadata.subtitleCodecs)
       let missingGlyph = false
+      const progress = new SubtitleProgressReader()
+      const encodingStartedAt = Date.now()
+      let processedSeconds = 0
       const result = await this.execute(batch, args, 0, (line) => {
+        if (batch.cancelled) return
         if (burning && /fontselect: failed to find (?:any )?fallback with glyph/i.test(line)) missingGlyph = true
-        const value = parseFfmpegProgress(line, metadata.duration)
-        if (value !== null && value > item.progress + 0.003) {
-          item.progress = Math.min(0.98, Math.max(item.progress, value))
-          this.emit(batch)
+        const sample = progress.push(line)
+        if (!sample) return
+        lastProgressAt = Date.now()
+        if (item.phase === 'encoding') item.message = burning ? '正在烧录字幕（重新编码视频）' : '正在封装字幕（复制音视频流）'
+        if (sample.processedSeconds !== undefined) processedSeconds = Math.max(processedSeconds, sample.processedSeconds)
+        if (sample.fps !== undefined) item.fps = sample.fps
+        if (sample.speed !== undefined) item.speed = sample.speed
+        item.elapsedSeconds = Math.max(0, (Date.now() - startedAt) / 1000)
+        if (metadata.duration > 0) item.progress = Math.max(item.progress, Math.min(1, processedSeconds / metadata.duration))
+        else if (sample.ended) item.progress = 1
+        item.estimatedRemainingSeconds = estimateSubtitleRemaining(metadata.duration, processedSeconds, (Date.now() - encodingStartedAt) / 1000, sample.ended || Boolean(sample.finalizing) || item.phase === 'finalizing')
+        if (sample.finalizing) {
+          item.phase = 'finalizing'
+          item.message = '视频编码完成，正在整理 MP4 快启索引'
+        } else if (sample.ended) {
+          item.phase = 'finalizing'
+          item.message = '编码已完成，正在整理文件索引并保存成品'
         }
+        this.emit(batch)
       }, burning ? temporaryDirectory : undefined)
       this.assertNotCancelled(batch)
       if (result.code !== 0) {
+        if (plan?.kind === 'intel-qsv') {
+          this.encoders.invalidate()
+          throw new Error(`Intel QSV 烧录过程中失败，已停止并清理半成品；未自动回退 CPU 或降低分辨率\n${result.stderr.slice(-2400)}`)
+        }
         const advice = !burning && batch.request.format === 'mp4' ? '；当前音视频编码或附件可能不兼容 MP4，可改用 MKV' : ''
         throw new Error(`FFmpeg ${burning ? '烧录字幕' : '封装'}失败${advice}\n${result.stderr.slice(-2400)}`)
       }
       if (missingGlyph) throw new Error('字幕包含内置字体无法绘制的字符，已停止输出；请检查字幕字符或使用支持该语言的字体')
       const outputInfo = await stat(partialPath)
       if (!outputInfo.isFile() || outputInfo.size === 0) throw new Error('FFmpeg 未生成有效的视频文件')
+      item.phase = 'finalizing'
+      item.message = '正在独占保存成品，避免覆盖已有文件'
+      item.estimatedRemainingSeconds = undefined
+      this.emit(batch)
       await ensureOutputDirectory(batch.snapshot.outputDirectory)
       this.assertNotCancelled(batch)
       item.outputPath = await this.publishOutput(batch, partialPath, parse(item.videoName).name)
@@ -257,11 +337,13 @@ export class SubtitleService {
         rm(partialPath, { force: true }),
         rm(temporaryDirectory, { recursive: true, force: true })
       ])
+      clearInterval(timer)
+      item.elapsedSeconds = Math.max(0, (Date.now() - startedAt) / 1000)
     }
   }
 
   /** 字体只在编码时使用，拷贝到固定相对路径；成品播放不再依赖字体或字幕文件。 */
-  private async prepareBurnFonts(batch: BatchContext, temporaryDirectory: string): Promise<void> {
+  private async prepareBurnFonts(batch: BatchContext, temporaryDirectory: string, videoPath: string): Promise<void> {
     const candidates = this.fontDirectory ? [this.fontDirectory] : [
       join(dirname(dirname(batch.executable)), 'subtitle-fonts'),
       ...(typeof process.resourcesPath === 'string' ? [join(process.resourcesPath, 'subtitle-fonts')] : []),
@@ -290,6 +372,24 @@ export class SubtitleService {
     const target = join(fonts, 'NotoSansSC.ttf')
     try { await link(source, target) }
     catch { await copyFile(source, target) }
+    let fontIndex = 0
+    const directory = dirname(videoPath)
+    for (const localDirectory of [directory, join(directory, 'fonts'), join(directory, '字体')]) {
+      const directoryInfo = await lstat(localDirectory).catch(() => null)
+      if (!directoryInfo?.isDirectory() || directoryInfo.isSymbolicLink()) continue
+      const entries = await readdir(localDirectory, { withFileTypes: true })
+      for (const entry of entries) {
+        this.assertNotCancelled(batch)
+        const extension = extname(entry.name).toLowerCase()
+        if (!entry.isFile() || !['.ttf', '.otf', '.ttc'].includes(extension)) continue
+        const fontPath = join(localDirectory, entry.name)
+        const info = await lstat(fontPath).catch(() => null)
+        if (!info?.isFile() || info.isSymbolicLink() || info.size < 1024) continue
+        const fontTarget = join(fonts, `local-font-${fontIndex++}${extension}`)
+        try { await link(fontPath, fontTarget) }
+        catch { await copyFile(fontPath, fontTarget) }
+      }
+    }
     this.assertNotCancelled(batch)
   }
 
@@ -368,7 +468,7 @@ export class SubtitleService {
         if (batch.child === child) batch.child = undefined
         if (onLine && lines) onLine(lines)
         if (startError) reject(new Error(`FFmpeg 启动失败：${startError.message}`))
-        else if (timedOut) reject(new Error('读取视频信息超时，请确认视频文件可正常访问'))
+        else if (timedOut) reject(new Error(args.includes('-init_hw_device') ? 'Intel QSV 硬件解码与字幕烧录预检超时；未自动回退 CPU，请检查驱动或明确选择 CPU 快速编码' : '读取视频信息超时，请确认视频文件可正常访问'))
         else resolveResult({ code, stderr })
       })
     })
@@ -495,7 +595,7 @@ export function buildSubtitleBurnArgs(video: string, subtitleName: string, outpu
   const args = [
     '-hide_banner', '-nostdin', '-progress', 'pipe:2', '-nostats', '-i', video,
     '-map', '0:V:0', '-map', '0:a?', '-map_metadata', '0', '-map_chapters', '0',
-    '-vf', filter, '-sn', '-dn', '-c:v', 'libx264', '-preset', 'medium', '-crf', '18', '-pix_fmt', 'yuv420p',
+    '-vf', filter, '-sn', '-dn', '-c:v', 'libx264', '-preset', 'veryfast', '-threads', '4', '-crf', '18', '-pix_fmt', 'yuv420p',
     '-c:a', 'aac', '-b:a', '192k', '-ac', '2'
   ]
   if (format === 'mp4') args.push('-movflags', '+faststart')
@@ -515,6 +615,8 @@ function validateRequest(request: SubtitleBatchRequest): void {
   if (!Array.isArray(request.items) || request.items.length === 0 || request.items.length > 10_000) throw new Error('每批请选择 1 到 10000 个视频')
   if (!['mkv', 'mp4'].includes(request.format)) throw new Error('输出格式无效')
   if (request.mode !== undefined && !['burn', 'soft'].includes(request.mode)) throw new Error('字幕嵌入模式无效')
+  if (request.acceleration !== undefined && !['auto', 'cpu-fast'].includes(request.acceleration)) throw new Error('硬件加速模式无效')
+  if (request.resolution !== undefined && !['source', '1080p'].includes(request.resolution)) throw new Error('输出分辨率模式无效')
   if (!['auto', 'utf8', 'gb18030', 'big5', 'shift_jis'].includes(request.encoding)) throw new Error('字幕编码无效')
   if (!Number.isFinite(request.offsetSeconds) || Math.abs(request.offsetSeconds) > 3600) throw new Error('字幕时间偏移必须在 -3600 到 3600 秒之间')
   if (request.items.some((item) => !item || typeof item.rowId !== 'string' || typeof item.subtitlePath !== 'string')) throw new Error('字幕任务参数无效')

@@ -21,6 +21,8 @@
     "tests/window-capture-*.test.ts",
     "tests/native-window-*.test.ts",
     "tests/subtitle-service.test.ts",
-    "tests/subtitle-burn.test.ts"
+    "tests/subtitle-burn.test.ts",
+    "tests/subtitle-encoding.test.ts",
+    "tests/subtitle-runtime.test.ts"
   ]
 }

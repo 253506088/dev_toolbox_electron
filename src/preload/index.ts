@@ -86,6 +86,7 @@ const api: ElectronApi = {
     onProgress: (callback) => subscribe<DictionaryProgress>('dictionary:progress', callback)
   },
   subtitles: {
+    hardwareStatus: (force) => ipcRenderer.invoke('subtitle:hardware-status', force),
     selectFolder: () => ipcRenderer.invoke('subtitle:select-folder'),
     selectVideo: () => ipcRenderer.invoke('subtitle:select-video'),
     scanPath: (path) => ipcRenderer.invoke('subtitle:scan-path', path),
