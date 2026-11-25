@@ -23,6 +23,8 @@
     "tests/subtitle-service.test.ts",
     "tests/subtitle-burn.test.ts",
     "tests/subtitle-encoding.test.ts",
-    "tests/subtitle-runtime.test.ts"
+    "tests/subtitle-runtime.test.ts",
+    "tests/embedded-subtitle.test.ts",
+    "tests/subtitle-embedded.test.ts"
   ]
 }

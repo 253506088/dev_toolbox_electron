@@ -20,7 +20,10 @@ class TestOwner extends EventEmitter {
   id = 11
   history: SubtitleBatchSnapshot[] = []
   isDestroyed(): boolean { return false }
-  send(channel: string, snapshot: SubtitleBatchSnapshot): void { this.history.push(snapshot); this.emit(channel, snapshot) }
+  send(channel: string, snapshot: SubtitleBatchSnapshot): void {
+    if (channel === 'subtitle:event') this.history.push(snapshot)
+    this.emit(channel, snapshot)
+  }
 }
 function owner(value: TestOwner): WebContents { return value as unknown as WebContents }
 function hash(bytes: Uint8Array): string { return createHash('sha256').update(bytes).digest('hex') }

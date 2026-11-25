@@ -8,7 +8,7 @@ import type {
 } from '../shared/electron-api'
 import type { BatchTaskEvent } from '../shared/batch-task'
 import type { MediaJobEvent } from '../shared/media-api'
-import type { SubtitleBatchSnapshot } from '../shared/subtitle-api'
+import type { SubtitleBatchSnapshot, SubtitleScanProgress } from '../shared/subtitle-api'
 import type { WechatCaptureEvent } from '../shared/wechat-capture'
 import type { WechatExportEvent } from '../shared/wechat-export'
 import type { CaptureFrameSourceBridge, CaptureFrameSourceCommand, CaptureFrameSourceResult } from '../shared/capture-frame-source'
@@ -95,7 +95,8 @@ const api: ElectronApi = {
     cancel: (batchId) => ipcRenderer.invoke('subtitle:cancel', batchId),
     snapshot: () => ipcRenderer.invoke('subtitle:snapshot'),
     openOutput: (batchId) => ipcRenderer.invoke('subtitle:open-output', batchId),
-    onEvent: (callback) => subscribe<SubtitleBatchSnapshot>('subtitle:event', callback)
+    onEvent: (callback) => subscribe<SubtitleBatchSnapshot>('subtitle:event', callback),
+    onScanProgress: (callback) => subscribe<SubtitleScanProgress>('subtitle:scan-progress', callback)
   },
   media: {
     selectImages: (multiple) => ipcRenderer.invoke('media:select-images', multiple),

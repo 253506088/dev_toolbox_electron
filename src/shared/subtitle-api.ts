@@ -21,12 +21,31 @@ export interface SubtitleHardwareStatus {
   checkedAt: string
 }
 
+/** 字幕来源必须明确区分真实外挂路径与当前视频内的流索引。 */
+export type SubtitleInputSource =
+  | { kind: 'external'; path: string }
+  | { kind: 'embedded'; streamIndex: number }
+
+export interface EmbeddedSubtitleTrack {
+  streamIndex: number
+  subtitleIndex: number
+  codec: string
+  language?: string
+  title?: string
+  default: boolean
+  forced?: boolean
+  supported: boolean
+}
+
 export interface SubtitleCandidate {
+  /** 外挂为真实路径；内置轨为空，通过 source 字段选择，绝不当文件路径使用。 */
   path: string
+  source?: SubtitleInputSource
   name: string
   score: number
   confidence: SubtitleConfidence
   reason: string
+  supported?: boolean
 }
 
 export interface SubtitleMatchRow {
@@ -35,6 +54,10 @@ export interface SubtitleMatchRow {
   videoName: string
   episode?: string
   subtitlePath: string | null
+  subtitleSource?: SubtitleInputSource
+  embeddedTracks?: EmbeddedSubtitleTrack[]
+  embeddedFontCount?: number
+  scanError?: string
   candidates: SubtitleCandidate[]
   confidence: SubtitleConfidence | null
   reason: string
@@ -46,12 +69,19 @@ export interface SubtitleScanResult {
   outputDirectory: string
   mode: 'folder' | 'video'
   subtitleCount: number
+  embeddedSubtitleCount?: number
   rows: SubtitleMatchRow[]
+}
+
+export interface SubtitleScanProgress {
+  completed: number
+  total: number
+  videoName: string
 }
 
 export interface SubtitleBatchRequest {
   scanId: string
-  items: Array<{ rowId: string; subtitlePath: string }>
+  items: Array<{ rowId: string; subtitlePath?: string; source?: SubtitleInputSource }>
   /** 缺省使用烧录，确保普通播放器直接显示字幕。 */
   mode?: SubtitleEmbedMode
   acceleration?: SubtitleAcceleration
@@ -68,6 +98,7 @@ export interface SubtitleBatchItem {
   videoPath: string
   videoName: string
   subtitlePath: string
+  source?: SubtitleInputSource
   subtitleName: string
   outputPath: string
   status: SubtitleItemStatus
@@ -110,4 +141,5 @@ export interface SubtitleApi {
   snapshot(): Promise<SubtitleBatchSnapshot | null>
   openOutput(batchId: string): Promise<void>
   onEvent(callback: (snapshot: SubtitleBatchSnapshot) => void): () => void
+  onScanProgress(callback: (progress: SubtitleScanProgress) => void): () => void
 }

@@ -3,7 +3,7 @@ import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { Ban, CheckCheck, ChevronRight, CircleCheck, FileVideo, FolderOpen, ListChecks, Play, RefreshCw, RotateCcw, Search, ShieldCheck, Subtitles, Upload } from '@lucide/vue'
 import { NButton, NCheckbox, NIcon, NInput, NInputNumber, NPagination, NProgress, NSelect, NTag, NTooltip, useMessage } from 'naive-ui'
 import type { FfmpegStatus } from '@shared/media-api'
-import type { SubtitleAcceleration, SubtitleBatchItem, SubtitleBatchSnapshot, SubtitleConfidence, SubtitleEmbedMode, SubtitleEncoding, SubtitleHardwareStatus, SubtitleMatchRow, SubtitleOutputFormat, SubtitleProcessingPhase, SubtitleResolution, SubtitleScanResult } from '@shared/subtitle-api'
+import type { EmbeddedSubtitleTrack, SubtitleAcceleration, SubtitleBatchItem, SubtitleBatchSnapshot, SubtitleCandidate, SubtitleConfidence, SubtitleEmbedMode, SubtitleEncoding, SubtitleHardwareStatus, SubtitleInputSource, SubtitleMatchRow, SubtitleOutputFormat, SubtitleProcessingPhase, SubtitleResolution, SubtitleScanProgress, SubtitleScanResult } from '@shared/subtitle-api'
 import ToolPage from '../components/ToolPage.vue'
 
 const message = useMessage()
@@ -30,9 +30,11 @@ const hardware = ref<SubtitleHardwareStatus | null>(null)
 const hardwareError = ref('')
 const checkingHardware = ref(true)
 const manualLoading = ref('')
+const scanProgress = ref<SubtitleScanProgress | null>(null)
 const bufferedEvents = new Map<string, SubtitleBatchSnapshot>()
 const notifiedBatches = new Set<string>()
 let unsubscribe: (() => void) | undefined
+let unsubscribeScan: (() => void) | undefined
 let eventRevision = 0
 let dragDepth = 0
 const PAGE_SIZE = 20
@@ -41,17 +43,20 @@ const running = computed(() => starting.value || batch.value?.status === 'runnin
 const busy = computed(() => running.value || loading.value || Boolean(manualLoading.value))
 const rows = computed(() => scan.value?.rows ?? [])
 const selectedRows = computed(() => rows.value.filter((row) => selectedIds.value.has(row.id)))
-const readyRows = computed(() => selectedRows.value.filter((row) => Boolean(row.subtitlePath)))
-const unmatchedCount = computed(() => selectedRows.value.length - readyRows.value.length)
+const readyRows = computed(() => selectedRows.value.filter(canProcessRow))
+const unmatchedCount = computed(() => selectedRows.value.filter((row) => !row.scanError && !hasSupportedSubtitle(row)).length)
+const scanErrorCount = computed(() => selectedRows.value.filter((row) => Boolean(row.scanError)).length)
+const embeddedSoftRows = computed(() => embedMode.value === 'soft' ? selectedRows.value.filter((row) => hasSupportedSubtitle(row) && selectedSource(row)?.kind === 'embedded') : [])
+const embeddedCount = computed(() => scan.value?.embeddedSubtitleCount ?? rows.value.reduce((count, row) => count + (row.embeddedTracks?.length ?? 0), 0))
 const reviewCount = computed(() => readyRows.value.filter((row) => row.confidence !== 'high').length)
 const allSelected = computed(() => rows.value.length > 0 && selectedRows.value.length === rows.value.length)
 const partialSelected = computed(() => selectedRows.value.length > 0 && !allSelected.value)
 const filteredRows = computed(() => {
   const query = search.value.trim().toLocaleLowerCase()
   return rows.value.filter((row) => {
-    if (query && !`${row.videoName} ${fileName(row.subtitlePath ?? '')} ${row.episode ?? ''}`.toLocaleLowerCase().includes(query)) return false
-    if (filter.value === 'unmatched') return !row.subtitlePath
-    if (filter.value === 'review') return Boolean(row.subtitlePath) && row.confidence !== 'high'
+    if (query && !`${row.videoName} ${selectedSubtitleLabel(row)} ${row.candidates.map((candidate) => candidateDisplayName(candidate, row)).join(' ')} ${row.episode ?? ''}`.toLocaleLowerCase().includes(query)) return false
+    if (filter.value === 'unmatched') return !hasSupportedSubtitle(row) || Boolean(row.scanError)
+    if (filter.value === 'review') return hasSupportedSubtitle(row) && row.confidence !== 'high'
     if (filter.value === 'selected') return selectedIds.value.has(row.id)
     return true
   })
@@ -73,13 +78,16 @@ const batchProgress = computed(() => {
   return items.length ? Math.round(items.reduce((total, item) => total + (['succeeded', 'failed', 'cancelled'].includes(item.status) ? 1 : item.progress), 0) / items.length * 100) : 0
 })
 const activeItem = computed(() => batch.value?.items.find((item) => item.status === 'running'))
-const retryRows = computed(() => rows.value.filter((row) => ['failed', 'cancelled'].includes(batchItemsByVideo.value.get(row.videoPath)?.status ?? '') && Boolean(row.subtitlePath)))
+const retryRows = computed(() => rows.value.filter((row) => ['failed', 'cancelled'].includes(batchItemsByVideo.value.get(row.videoPath)?.status ?? '') && canProcessRow(row)))
 const encodingReady = computed(() => embedMode.value === 'soft' || acceleration.value === 'cpu-fast' || (!checkingHardware.value && !hardwareError.value && hardware.value?.qsvAvailable === true))
-const canStart = computed(() => Boolean(scan.value) && readyRows.value.length > 0 && !busy.value && ffmpeg.value.available && offsetSeconds.value !== null && encodingReady.value)
+const canStart = computed(() => Boolean(scan.value) && readyRows.value.length > 0 && embeddedSoftRows.value.length === 0 && !busy.value && ffmpeg.value.available && offsetSeconds.value !== null && encodingReady.value)
 const hardwareMessage = computed(() => checkingHardware.value ? '正在读取本机硬件并实测 QSV 编码…' : hardwareError.value || hardware.value?.message || '硬件检测尚未完成')
 const reusedSubtitles = computed(() => {
   const counts = new Map<string, number>()
-  for (const row of readyRows.value) if (row.subtitlePath) counts.set(row.subtitlePath, (counts.get(row.subtitlePath) ?? 0) + 1)
+  for (const row of readyRows.value) {
+    const source = selectedSource(row)
+    if (source?.kind === 'external') counts.set(source.path, (counts.get(source.path) ?? 0) + 1)
+  }
   return new Set([...counts].filter(([, count]) => count > 1).map(([path]) => path))
 })
 
@@ -105,6 +113,57 @@ watch([search, filter], () => { page.value = 1 })
 watch(() => filteredRows.value.length, (length) => { page.value = Math.min(page.value, Math.max(1, Math.ceil(length / PAGE_SIZE))) })
 
 function fileName(path: string): string { return path.split(/[\\/]/).pop() ?? path }
+function selectedSource(row: SubtitleMatchRow): SubtitleInputSource | undefined {
+  return row.subtitleSource ?? (row.subtitlePath ? { kind: 'external', path: row.subtitlePath } : undefined)
+}
+function sourceKey(source: SubtitleInputSource): string { return source.kind === 'embedded' ? `embedded:${source.streamIndex}` : source.path }
+function candidateSource(candidate: SubtitleCandidate): SubtitleInputSource { return candidate.source ?? { kind: 'external', path: candidate.path } }
+function candidateKey(candidate: SubtitleCandidate): string { return sourceKey(candidateSource(candidate)) }
+function selectionValue(row: SubtitleMatchRow): string | null { const source = selectedSource(row); return source ? sourceKey(source) : null }
+function selectedCandidate(row: SubtitleMatchRow): SubtitleCandidate | undefined { return row.candidates.find((candidate) => candidateKey(candidate) === selectionValue(row)) }
+function selectedTrack(row: SubtitleMatchRow): EmbeddedSubtitleTrack | undefined {
+  const source = selectedSource(row)
+  return source?.kind === 'embedded' ? row.embeddedTracks?.find((track) => track.streamIndex === source.streamIndex) : undefined
+}
+function hasSupportedSubtitle(row: SubtitleMatchRow): boolean {
+  const source = selectedSource(row)
+  return Boolean(source && selectedCandidate(row)?.supported !== false && selectedTrack(row)?.supported !== false && (source.kind === 'embedded' || source.path))
+}
+function canProcessRow(row: SubtitleMatchRow): boolean { return !row.scanError && hasSupportedSubtitle(row) && (embedMode.value === 'burn' || selectedSource(row)?.kind === 'external') }
+function trackLanguageLabel(track: EmbeddedSubtitleTrack): string {
+  const title = track.title ?? ''
+  const tags = `${title} ${track.language ?? ''}`
+  const simplified = /(?:chs|zh[-_. ]?hans|zh[-_. ]?cn|简体|简中)/i.test(tags)
+  const traditional = /(?:cht|zh[-_. ]?hant|zh[-_. ]?tw|繁体|繁中)/i.test(tags)
+  const japanese = /(?:(?:^|[^a-z])jpn(?:$|[^a-z])|japanese|日语|日文|中日|简日|繁日)/i.test(title)
+  const english = /(?:(?:^|[^a-z])eng(?:$|[^a-z])|english|英语|英文|中英|简英|繁英)/i.test(title)
+  if (simplified || traditional) return `${simplified ? '简体' : '繁体'}${japanese ? ' / 日语双语' : english ? ' / 英语双语' : '中文'}`
+  if (/(?:chi|zho|zh)(?:$|[-_])/i.test(track.language ?? '')) return '中文'
+  if (/^(?:jpn|ja)$/i.test(track.language ?? '')) return '日语'
+  if (/^(?:eng|en)$/i.test(track.language ?? '')) return '英语'
+  return track.language ? `语言 ${track.language}` : '语言未标注'
+}
+function trackCodecLabel(codec: string): string {
+  const name = codec.toLowerCase()
+  return ({ ass: 'ASS', ssa: 'SSA', subrip: 'SRT', srt: 'SRT', webvtt: 'VTT', vtt: 'VTT', mov_text: '文本字幕', text: '文本字幕', hdmv_pgs_subtitle: 'PGS 图片字幕', dvd_subtitle: 'DVD 图片字幕', dvb_subtitle: 'DVB 图片字幕' } as Record<string, string>)[name] ?? codec.toUpperCase()
+}
+function candidateDisplayName(candidate: SubtitleCandidate, row?: SubtitleMatchRow): string {
+  const source = candidateSource(candidate)
+  if (source.kind === 'external') return candidate.name
+  const track = row?.embeddedTracks?.find((item) => item.streamIndex === source.streamIndex)
+  if (!track) return candidate.name
+  const group = /\[([^\]]+)\]/.exec(track.title ?? '')?.[1]
+  const title = group || track.title?.replace(/^(?:chs|cht|zh[-_. ]?(?:hans|hant|cn|tw))(?:(?:[&+._ -])(?:jpn|eng))*\s*/i, '').trim()
+  return [`第 ${track.subtitleIndex + 1} 条`, trackLanguageLabel(track), title, trackCodecLabel(track.codec), track.default ? '原片默认' : '', track.forced ? '强制字幕' : '', track.supported ? '' : '暂不支持'].filter(Boolean).join(' · ')
+}
+function selectedSubtitleLabel(row: SubtitleMatchRow): string { const candidate = selectedCandidate(row); return candidate ? candidateDisplayName(candidate, row) : fileName(row.subtitlePath ?? '') }
+function sourceKind(row: SubtitleMatchRow): 'embedded' | 'external' | 'none' { return selectedSource(row)?.kind ?? 'none' }
+function sourceBadgeLabel(row: SubtitleMatchRow): string { return sourceKind(row) === 'embedded' ? '视频内字幕' : sourceKind(row) === 'external' ? '外挂字幕' : '未选择' }
+function rowConfidenceLabel(row: SubtitleMatchRow): string {
+  if (selectedSource(row) && !hasSupportedSubtitle(row)) return '此字幕暂不支持'
+  if (sourceKind(row) === 'embedded') return row.confidence === 'high' ? '内置字幕已选' : '请确认字幕语言'
+  return confidenceLabel(row.confidence)
+}
 function formatError(error: unknown): string { return error instanceof Error ? error.message.replace(/^Error invoking remote method '[^']+': (?:Error: )?/, '') : String(error) }
 function confidenceLabel(confidence: SubtitleConfidence | null): string { return confidence ? { high: '匹配可靠', medium: '建议确认', low: '需要确认' }[confidence] : '未匹配' }
 function confidenceType(confidence: SubtitleConfidence | null): 'success' | 'warning' | 'default' { return confidence === 'high' ? 'success' : confidence ? 'warning' : 'default' }
@@ -191,7 +250,12 @@ function invertSelection(): void {
   if (!busy.value) selectedIds.value = new Set(rows.value.filter((row) => !selectedIds.value.has(row.id)).map((row) => row.id))
 }
 function selectReliable(): void {
-  if (!busy.value) selectedIds.value = new Set(rows.value.filter((row) => row.subtitlePath && row.confidence === 'high').map((row) => row.id))
+  if (!busy.value) selectedIds.value = new Set(rows.value.filter((row) => canProcessRow(row) && row.confidence === 'high').map((row) => row.id))
+}
+function deselectEmbeddedSoftRows(): void {
+  if (busy.value) return
+  const excluded = new Set(embeddedSoftRows.value.map((row) => row.id))
+  selectedIds.value = new Set([...selectedIds.value].filter((id) => !excluded.has(id)))
 }
 
 function applyScan(result: SubtitleScanResult): void {
@@ -209,6 +273,7 @@ function selectAllAfterScan(result: SubtitleScanResult): void { selectedIds.valu
 async function chooseSource(mode: 'folder' | 'video'): Promise<void> {
   if (busy.value) return
   loading.value = true
+  scanProgress.value = null
   errorText.value = ''
   try {
     const result = await (mode === 'folder' ? window.electronApi.subtitles.selectFolder() : window.electronApi.subtitles.selectVideo())
@@ -222,6 +287,7 @@ async function rescan(): Promise<void> {
   const path = scan.value.mode === 'video' ? scan.value.rows[0]?.videoPath : scan.value.directory
   if (!path) return
   loading.value = true
+  scanProgress.value = null
   errorText.value = ''
   try { applyScan(await window.electronApi.subtitles.scanPath(path)) }
   catch (error) { errorText.value = formatError(error) }
@@ -246,21 +312,28 @@ async function dropSource(event: DragEvent): Promise<void> {
   const path = window.electronApi.media.pathForFile(files[0])
   if (!path) { message.warning('无法读取拖入文件的位置，请使用选择按钮'); return }
   loading.value = true
+  scanProgress.value = null
   errorText.value = ''
   try { applyScan(await window.electronApi.subtitles.scanPath(path)) }
   catch (error) { errorText.value = formatError(error) }
   finally { loading.value = false }
 }
 
-function candidateOptions(row: SubtitleMatchRow): Array<{ label: string; value: string }> {
-  return row.candidates.map((candidate) => ({ label: `${candidate.name}  ·  匹配 ${candidate.score}`, value: candidate.path }))
+function candidateOptions(row: SubtitleMatchRow): Array<{ label: string; value: string; disabled: boolean }> {
+  return row.candidates.map((candidate) => {
+    const source = candidateSource(candidate)
+    const track = source.kind === 'embedded' ? row.embeddedTracks?.find((item) => item.streamIndex === source.streamIndex) : undefined
+    return { label: source.kind === 'embedded' ? `视频内 · ${candidateDisplayName(candidate, row)}` : `外挂 · ${candidate.name} · 匹配 ${candidate.score}`, value: candidateKey(candidate), disabled: candidate.supported === false || track?.supported === false || (source.kind === 'external' && !source.path) }
+  })
 }
-function changeSubtitle(row: SubtitleMatchRow, path: string | null): void {
+function changeSubtitle(row: SubtitleMatchRow, value: string | null): void {
   if (busy.value) return
-  const candidate = row.candidates.find((item) => item.path === path)
-  row.subtitlePath = path
+  const candidate = row.candidates.find((item) => candidateKey(item) === value)
+  if (candidate?.supported === false) { message.warning(candidate.reason || '此字幕轨暂不支持烧录'); return }
+  row.subtitleSource = candidate ? candidateSource(candidate) : undefined
+  row.subtitlePath = row.subtitleSource?.kind === 'external' ? row.subtitleSource.path : null
   row.confidence = candidate?.confidence ?? null
-  row.reason = candidate?.reason ?? '请从候选中选择字幕，或手动指定文件'
+  row.reason = candidate?.reason ?? '请从视频内字幕或外挂候选中选择，也可以手动指定字幕文件'
 }
 async function chooseSubtitle(row: SubtitleMatchRow): Promise<void> {
   if (!scan.value || busy.value) return
@@ -268,8 +341,9 @@ async function chooseSubtitle(row: SubtitleMatchRow): Promise<void> {
   try {
     const candidate = await window.electronApi.subtitles.selectSubtitle(scan.value.scanId, row.id)
     if (!candidate) return
-    row.candidates = [candidate, ...row.candidates.filter((item) => item.path !== candidate.path)]
-    row.subtitlePath = candidate.path
+    row.candidates = [candidate, ...row.candidates.filter((item) => candidateKey(item) !== candidateKey(candidate))]
+    row.subtitleSource = candidateSource(candidate)
+    row.subtitlePath = row.subtitleSource.kind === 'external' ? row.subtitleSource.path : null
     row.confidence = candidate.confidence
     row.reason = candidate.reason
   } catch (error) { message.error(formatError(error)) }
@@ -306,7 +380,7 @@ function handleEvent(snapshot: SubtitleBatchSnapshot): void {
 }
 
 async function startBatch(onlyRetry = false): Promise<void> {
-  if (!scan.value || busy.value || !ffmpeg.value.available || !encodingReady.value) return
+  if (!scan.value || busy.value || !ffmpeg.value.available || !encodingReady.value || embeddedSoftRows.value.length) return
   const targets = onlyRetry ? retryRows.value : readyRows.value
   if (!targets.length || offsetSeconds.value === null) return
   starting.value = true
@@ -315,7 +389,12 @@ async function startBatch(onlyRetry = false): Promise<void> {
   try {
     const result = await window.electronApi.subtitles.start({
       scanId: scan.value.scanId,
-      items: targets.map((row) => ({ rowId: row.id, subtitlePath: row.subtitlePath! })),
+      items: targets.map((row) => {
+        const source = selectedSource(row)!
+        return { rowId: row.id, source: source.kind === 'embedded'
+          ? { kind: 'embedded' as const, streamIndex: source.streamIndex }
+          : { kind: 'external' as const, path: source.path } }
+      }),
       mode: embedMode.value,
       acceleration: acceleration.value,
       resolution: embedMode.value === 'burn' ? resolution.value : 'source',
@@ -357,6 +436,7 @@ async function refreshHardware(force = false): Promise<void> {
 
 onMounted(() => {
   unsubscribe = window.electronApi.subtitles.onEvent(handleEvent)
+  unsubscribeScan = window.electronApi.subtitles.onScanProgress((progress) => { if (loading.value) scanProgress.value = progress })
   const revision = eventRevision
   void window.electronApi.subtitles.snapshot().then((snapshot) => {
     if (eventRevision !== revision || !snapshot) return
@@ -372,11 +452,11 @@ onMounted(() => {
   void refreshFfmpeg()
   void refreshHardware()
 })
-onUnmounted(() => unsubscribe?.())
+onUnmounted(() => { unsubscribe?.(); unsubscribeScan?.() })
 </script>
 
 <template>
-  <ToolPage title="外挂字幕内嵌">
+  <ToolPage title="视频字幕烧录">
     <template #actions>
       <NButton data-testid="subtitle-select-folder" :disabled="busy" :loading="loading" @click="chooseSource('folder')"><template #icon><NIcon :component="FolderOpen" /></template>选择文件夹</NButton>
       <NButton data-testid="subtitle-select-video" :disabled="busy" @click="chooseSource('video')"><template #icon><NIcon :component="FileVideo" /></template>选择视频</NButton>
@@ -388,6 +468,7 @@ onUnmounted(() => unsubscribe?.())
     <div class="subtitle-workspace" :class="{ 'is-dragging': dragging }" @dragenter="dragEnter" @dragleave="dragLeave" @dragover.prevent @drop="dropSource">
       <div v-if="dragging" class="drop-overlay"><Upload :size="40" /><strong>松开以匹配字幕</strong><span>支持一个文件夹或一个视频</span></div>
       <div v-if="errorText" class="error-banner" role="alert"><span>{{ errorText }}</span><NButton size="tiny" quaternary @click="errorText = ''">关闭</NButton></div>
+      <div v-if="loading" data-testid="subtitle-scan-progress" :data-completed="scanProgress?.completed ?? 0" :data-total="scanProgress?.total ?? 0" class="scan-progress" aria-live="polite"><div><strong>正在读取视频字幕{{ scanProgress?.total ? ` ${scanProgress.completed}/${scanProgress.total}` : '…' }}</strong><span v-if="scanProgress?.videoName" :title="scanProgress.videoName">{{ scanProgress.videoName }}</span></div><NProgress v-if="scanProgress?.total" type="line" :percentage="Math.round(scanProgress.completed / scanProgress.total * 100)" :show-indicator="false" /></div>
 
       <div class="workspace-columns">
         <section class="matching-panel">
@@ -398,22 +479,25 @@ onUnmounted(() => unsubscribe?.())
               <NTag size="small">{{ scan.mode === 'folder' ? '整个文件夹' : '单个视频' }}</NTag>
               <NTooltip><template #trigger><NButton quaternary circle :disabled="busy" aria-label="重新扫描当前目录" @click="rescan"><template #icon><NIcon :component="RefreshCw" /></template></NButton></template>重新匹配</NTooltip>
             </div>
-            <div class="match-heading"><div><strong>视频与字幕匹配</strong><span>{{ rows.length }} 个视频 · {{ scan.subtitleCount }} 个外挂字幕</span></div><span class="scope-note">扫描当前目录</span></div>
+            <div class="match-heading"><div><strong>视频与字幕选择</strong><span>{{ rows.length }} 个视频 · {{ embeddedCount }} 条视频内字幕 · {{ scan.subtitleCount }} 个外挂字幕</span></div><span class="scope-note">扫描当前目录</span></div>
             <div class="list-controls">
               <NInput v-model:value="search" clearable placeholder="搜索视频、字幕或集数" size="small"><template #prefix><NIcon :component="Search" /></template></NInput>
               <NSelect v-model:value="filter" :options="filterOptions" size="small" class="filter-select" aria-label="筛选匹配结果" />
             </div>
             <div class="selection-toolbar">
               <NCheckbox :checked="allSelected" :indeterminate="partialSelected" :disabled="busy || !rows.length" @update:checked="selectAll">全选 <span class="selection-count">{{ selectedRows.length }}/{{ rows.length }}</span></NCheckbox>
-              <div><NButton size="tiny" quaternary :disabled="busy || !rows.length" @click="invertSelection">反选</NButton><NButton size="tiny" quaternary :disabled="busy || !rows.length" @click="selectReliable"><template #icon><NIcon :component="CheckCheck" /></template>只选可靠匹配</NButton></div>
+              <div><NButton size="tiny" quaternary :disabled="busy || !rows.length" @click="invertSelection">反选</NButton><NButton size="tiny" quaternary :disabled="busy || !rows.length" @click="selectReliable"><template #icon><NIcon :component="CheckCheck" /></template>只选推荐字幕</NButton></div>
             </div>
             <div class="match-list" aria-label="视频字幕匹配列表" :aria-busy="loading">
-              <article v-for="row in pageRows" :key="row.id" data-testid="subtitle-match-row" :data-row-id="row.id" class="match-row" :class="{ 'is-selected': selectedIds.has(row.id), 'is-unmatched': !row.subtitlePath }">
+              <article v-for="row in pageRows" :key="row.id" data-testid="subtitle-match-row" :data-row-id="row.id" :data-source-kind="sourceKind(row)" class="match-row" :class="{ 'is-selected': selectedIds.has(row.id), 'is-unmatched': !hasSupportedSubtitle(row) || row.scanError }">
                 <div class="row-select"><NCheckbox data-testid="subtitle-row-checkbox" :checked="selectedIds.has(row.id)" :disabled="busy" :aria-label="`选择视频 ${row.videoName}`" @update:checked="selectRow(row.id, $event)" /></div>
                 <div class="row-content">
                   <div class="video-line"><FileVideo :size="17" /><strong :title="row.videoPath">{{ row.videoName }}</strong><NTag v-if="row.episode" size="tiny" class="episode-tag">{{ row.episode }}</NTag></div>
-                  <div class="subtitle-line"><ChevronRight :size="15" class="pair-arrow" /><NSelect :value="row.subtitlePath" :options="candidateOptions(row)" :disabled="busy" clearable filterable size="small" placeholder="未找到合适字幕，请手动选择" :title="row.subtitlePath ?? undefined" :aria-label="`${row.videoName} 的外挂字幕`" @update:value="changeSubtitle(row, $event)" /><NTooltip><template #trigger><NButton data-testid="subtitle-select-subtitle" size="small" secondary :disabled="busy" :loading="manualLoading === row.id" :aria-label="`为 ${row.videoName} 选择字幕文件`" @click="chooseSubtitle(row)"><template #icon><NIcon :component="FolderOpen" /></template><span class="manual-label">指定</span></NButton></template>手动选择字幕文件</NTooltip></div>
-                  <div class="match-explanation"><NTag size="tiny" :type="confidenceType(row.confidence)">{{ confidenceLabel(row.confidence) }}</NTag><span :title="row.reason">{{ row.reason }}</span><span v-if="row.subtitlePath && reusedSubtitles.has(row.subtitlePath)" class="reuse-warning">同一字幕被多次选择</span></div>
+                  <div class="subtitle-line"><ChevronRight :size="15" class="pair-arrow" /><NSelect data-testid="subtitle-track-select" :data-source-kind="sourceKind(row)" :value="selectionValue(row)" :options="candidateOptions(row)" :disabled="busy" clearable filterable size="small" placeholder="请选择视频内字幕或外挂文件" :title="selectedSubtitleLabel(row) || undefined" :aria-label="`${row.videoName} 的字幕来源`" @update:value="changeSubtitle(row, $event)" /><NTooltip><template #trigger><NButton data-testid="subtitle-select-subtitle" size="small" secondary :disabled="busy" :loading="manualLoading === row.id" :aria-label="`为 ${row.videoName} 选择外挂字幕文件`" @click="chooseSubtitle(row)"><template #icon><NIcon :component="FolderOpen" /></template><span class="manual-label">指定</span></NButton></template>手动选择外挂字幕文件</NTooltip></div>
+                  <div class="match-explanation"><NTag data-testid="subtitle-source-kind" :data-kind="sourceKind(row)" size="tiny" :type="sourceKind(row) === 'embedded' ? 'info' : 'default'">{{ sourceBadgeLabel(row) }}</NTag><NTag size="tiny" :type="selectedSource(row) && !hasSupportedSubtitle(row) ? 'warning' : confidenceType(row.confidence)">{{ rowConfidenceLabel(row) }}</NTag><span :title="row.reason">{{ row.reason }}</span><span v-if="row.subtitlePath && reusedSubtitles.has(row.subtitlePath)" class="reuse-warning">同一外挂字幕被多次选择</span></div>
+                  <p v-if="sourceKind(row) === 'embedded' && row.embeddedFontCount" class="font-hint">附带 {{ row.embeddedFontCount }} 个字体，烧录时自动保留字幕样式。</p>
+                  <p v-if="row.scanError" class="row-warning" role="alert">无法读取此视频：{{ row.scanError }}。本项将跳过，可重新扫描。</p>
+                  <p v-if="embedMode === 'soft' && sourceKind(row) === 'embedded' && hasSupportedSubtitle(row)" class="row-warning">视频已有内置字幕；本项需切换“烧录到画面”，不会重复内封。</p>
                   <div v-if="batchItemsByVideo.has(row.videoPath)" data-testid="subtitle-batch-item" :data-status="batchItemsByVideo.get(row.videoPath)!.status" class="row-result" :class="`result-${batchItemsByVideo.get(row.videoPath)!.status}`">
                     <NProgress v-if="batchItemsByVideo.get(row.videoPath)!.status === 'running'" type="line" :percentage="Math.round(batchItemsByVideo.get(row.videoPath)!.progress * 100)" :show-indicator="false" :processing="true" />
                     <CircleCheck v-if="batchItemsByVideo.get(row.videoPath)!.status === 'succeeded'" :size="14" />
@@ -429,8 +513,8 @@ onUnmounted(() => unsubscribe?.())
 
           <div v-else-if="!batch" class="welcome-state">
             <div class="welcome-art"><FileVideo :size="44" /><span><Subtitles :size="25" /></span></div>
-            <div class="welcome-copy"><h2>让字幕直接出现在视频画面里</h2><p>默认烧录字幕，复制到手机、电视也能直接显示。<br>自动匹配同目录字幕，勾选视频后即可批量处理。</p></div>
-            <div class="source-choices"><button :disabled="busy" @click="chooseSource('folder')"><FolderOpen :size="23" /><strong>处理整个文件夹</strong><span>自动匹配所有视频，默认全选</span></button><button :disabled="busy" @click="chooseSource('video')"><FileVideo :size="23" /><strong>处理单个视频</strong><span>自动查找同目录字幕</span></button></div>
+            <div class="welcome-copy"><h2>让字幕直接出现在视频画面里</h2><p>有视频内字幕或外挂字幕都可以。<br>选择文件夹，确认中文轨，再点烧录；新视频拷到平板就能直接显示。</p></div>
+            <div class="source-choices"><button :disabled="busy" @click="chooseSource('folder')"><FolderOpen :size="23" /><strong>处理整个文件夹</strong><span>读取内置轨并匹配外挂，默认全选</span></button><button :disabled="busy" @click="chooseSource('video')"><FileVideo :size="23" /><strong>处理单个视频</strong><span>读取字幕轨，也可手动指定外挂</span></button></div>
             <div class="drag-hint"><Upload :size="15" /><span>也可以把文件夹或视频拖到这里</span></div>
             <div class="welcome-steps"><span><i>1</i>选择视频</span><ChevronRight :size="14" /><span><i>2</i>确认字幕</span><ChevronRight :size="14" /><span><i>3</i>烧录到画面</span></div>
           </div>
@@ -452,7 +536,7 @@ onUnmounted(() => unsubscribe?.())
           <div class="settings-scroll">
           <section data-testid="subtitle-hardware-status" :data-qsv-available="hardware?.qsvAvailable ?? false" :data-checking="checkingHardware" class="hardware-card"><div class="hardware-heading"><strong>{{ hardware?.gpuName || (checkingHardware ? '正在读取本机硬件' : '本机硬件检测') }}</strong><NTooltip><template #trigger><NButton quaternary circle size="tiny" :disabled="busy || checkingHardware" :loading="checkingHardware" aria-label="重新检测本机硬件加速" @click="refreshHardware(true)"><template #icon><NIcon :component="RefreshCw" /></template></NButton></template>重新检测本机设备与 QSV 硬件编码</NTooltip></div><span v-if="hardware?.cpuName" class="hardware-device">{{ hardware.cpuName }}</span><span v-if="hardware?.driverVersion" class="hardware-device">显卡驱动 {{ hardware.driverVersion }}</span><NTag size="tiny" :type="checkingHardware ? 'default' : hardware?.qsvAvailable && !hardwareError ? 'success' : 'warning'">{{ checkingHardware ? '正在检测硬件加速' : hardware?.qsvAvailable && !hardwareError ? 'Intel QSV 已就绪' : 'QSV 尚不可用' }}</NTag><p :class="{ 'hardware-warning': !checkingHardware && (!hardware?.qsvAvailable || hardwareError) }">{{ hardwareMessage }}</p></section>
           <div class="setting-section mode-section"><label class="setting-label">字幕处理方式</label><div class="mode-choices"><button data-testid="subtitle-mode-burn" :class="{ active: embedMode === 'burn' }" :disabled="busy" :aria-pressed="embedMode === 'burn'" @click="changeMode('burn')"><div><strong>烧录到画面</strong><span>推荐</span></div><small>跨设备播放，字幕直接可见</small></button><button data-testid="subtitle-mode-soft" :class="{ active: embedMode === 'soft' }" :disabled="busy" :aria-pressed="embedMode === 'soft'" @click="changeMode('soft')"><div><strong>内置字幕轨</strong><span>可开关</span></div><small>需要播放器支持并开启字幕轨</small></button></div><p class="setting-description mode-description">{{ embedMode === 'burn' ? '字幕成为画面的一部分，复制视频到手机、电视等设备也能直接显示；无法关闭字幕。视频会重新编码，耗时更长。' : '字幕存入视频文件无需外挂，但播放器需要支持并开启字幕轨。视频与音频直接复制，处理更快。' }}</p></div>
-          <div class="preserve-note"><ShieldCheck :size="19" /><div><strong>原文件完整保留</strong><span>原视频和外挂字幕均不修改。<br>处理结果另存到专属输出文件夹。</span></div></div>
+          <div class="preserve-note"><ShieldCheck :size="19" /><div><strong>原文件完整保留</strong><span>原视频、视频内字幕及外挂文件均不修改。<br>字幕和字体自动读取，成品另存。</span></div></div>
           <template v-if="embedMode === 'burn'">
             <div class="setting-section"><label class="setting-label">编码方式</label><div class="mode-choices"><button data-testid="subtitle-acceleration-auto" :class="{ active: acceleration === 'auto' }" :disabled="busy" :aria-pressed="acceleration === 'auto'" @click="changeAcceleration('auto')"><div><strong>自动硬件加速</strong><span>推荐</span></div><small>使用本机已通过实际检测的 Intel QSV</small></button><button data-testid="subtitle-acceleration-cpu-fast" :class="{ active: acceleration === 'cpu-fast' }" :disabled="busy" :aria-pressed="acceleration === 'cpu-fast'" @click="changeAcceleration('cpu-fast')"><div><strong>CPU 快速编码</strong><span>veryfast</span></div><small>明确使用 CPU，速度仍取决于分辨率</small></button></div><p class="setting-description">{{ acceleration === 'cpu-fast' ? '使用 CPU 的 veryfast 编码预设，比原先的 medium 更快。4K 仍需处理大量像素，实际速度见运行进度。' : '根据本机实际检测结果启用硬件解码与编码。加速不可用时会提示原因，不会自动切换为 CPU 编码。' }}</p></div>
             <div class="setting-section"><label class="setting-label" for="subtitle-resolution">输出分辨率</label><NSelect id="subtitle-resolution" v-model:value="resolution" data-testid="subtitle-resolution" :data-resolution="resolution" aria-label="输出分辨率" :options="resolutionOptions" :disabled="busy" size="small" /><p class="setting-description" :class="{ 'resolution-note': resolution === '1080p' }">{{ resolution === 'source' ? '保留原始宽高，4K 视频默认仍输出 4K；不会为了提速自动缩小画面。' : '主动降低到最高 1080p，可减少编码量；保留画面比例，较小视频不会放大。' }}</p></div>
@@ -464,12 +548,12 @@ onUnmounted(() => unsubscribe?.())
           </div>
           <div class="run-area">
             <div v-if="embedMode === 'burn' && acceleration === 'auto' && !encodingReady && !running" class="acceleration-warning"><span>{{ checkingHardware ? '正在验证硬件加速，可先选择视频并确认字幕。' : '自动加速当前不可用。请查看检测原因，或明确选择 CPU 快速编码后开始。' }}</span><NButton v-if="!checkingHardware" size="tiny" secondary :disabled="busy" @click="changeAcceleration('cpu-fast')">使用 CPU 快速编码</NButton></div>
-            <template v-if="scan"><div class="ready-summary"><ListChecks :size="19" /><span>将处理 <strong>{{ readyRows.length }}</strong> 个视频</span></div><p v-if="unmatchedCount" class="run-warning">{{ unmatchedCount }} 个已勾选视频没有字幕，将跳过。可在左侧手动指定。</p><p v-if="reviewCount" class="run-warning">{{ reviewCount }} 项匹配需要确认，请检查字幕是否对应。</p><p v-if="reusedSubtitles.size" class="run-warning">存在字幕重复使用，请确认是否为同一内容。</p></template>
+            <template v-if="scan"><div class="ready-summary"><ListChecks :size="19" /><span>将处理 <strong>{{ readyRows.length }}</strong> 个视频</span></div><p v-if="unmatchedCount" class="run-warning">{{ unmatchedCount }} 个已勾选视频没有可用字幕，将跳过。可在左侧选轨或指定外挂。</p><p v-if="scanErrorCount" class="run-warning">{{ scanErrorCount }} 个视频读取失败，将跳过。可修复后重新扫描。</p><div v-if="embeddedSoftRows.length" class="source-mode-warning"><p>{{ embeddedSoftRows.length }} 个已勾选视频使用内置字幕，当前模式无法处理，开始按钮已暂停。请切回烧录，或取消这些项。</p><div><NButton size="tiny" secondary :disabled="busy" @click="changeMode('burn')">切回烧录</NButton><NButton size="tiny" quaternary :disabled="busy" @click="deselectEmbeddedSoftRows">取消这些项</NButton></div></div><p v-if="reviewCount" class="run-warning">{{ reviewCount }} 项字幕需要确认，请检查语言或文件是否对应。</p><p v-if="reusedSubtitles.size" class="run-warning">存在外挂字幕重复使用，请确认是否为同一内容。</p></template>
             <NButton data-testid="subtitle-start" type="primary" size="large" block :disabled="!canStart" :loading="starting" @click="startBatch()"><template #icon><NIcon :component="Play" /></template>{{ starting ? '正在启动' : running ? `${operationLabel(batch?.mode ?? embedMode)}中…` : embedMode === 'burn' ? '开始烧录字幕' : '开始内封字幕轨' }}</NButton>
-            <NButton v-if="retryRows.length && !running" block secondary :disabled="busy || !ffmpeg.available || !encodingReady" @click="startBatch(true)"><template #icon><NIcon :component="RotateCcw" /></template>重试失败 / 取消项（{{ retryRows.length }}）</NButton>
+            <NButton v-if="retryRows.length && !running" block secondary :disabled="busy || !ffmpeg.available || !encodingReady || embeddedSoftRows.length > 0" @click="startBatch(true)"><template #icon><NIcon :component="RotateCcw" /></template>重试失败 / 取消项（{{ retryRows.length }}）</NButton>
             <NButton v-if="batch && batch.status === 'running'" block secondary @click="openOutput"><template #icon><NIcon :component="FolderOpen" /></template>打开输出目录</NButton>
             <div v-if="!ffmpeg.available && !checkingFfmpeg" class="ffmpeg-warning"><span>{{ ffmpeg.message }}</span><NButton size="tiny" secondary :loading="checkingFfmpeg" @click="refreshFfmpeg">重新检测</NButton></div>
-            <p class="run-footnote">{{ running ? '可以切换其他页签，任务会继续。停止时保留已完成的视频。' : 'SRT · ASS · SSA · VTT / 自动匹配后可手动调整' }}</p>
+            <p class="run-footnote">{{ running ? '可以切换其他页签，任务会继续。停止时保留已完成的视频。' : '读取视频内字幕 / 匹配外挂文件 / 确认后烧录' }}</p>
           </div>
         </aside>
       </div>
@@ -482,6 +566,10 @@ onUnmounted(() => unsubscribe?.())
 .workspace-columns { display: grid; grid-template-columns: minmax(0, 1fr) 290px; flex: 1; min-height: 0; gap: 18px; }
 .matching-panel { display: flex; flex-direction: column; min-width: 0; min-height: 0; gap: 10px; }
 .error-banner { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 8px 12px; border: 1px solid var(--error-color); border-radius: 6px; background: var(--surface-muted); color: var(--error-color); overflow-wrap: anywhere; }
+.scan-progress { display: flex; flex-direction: column; flex-shrink: 0; gap: 5px; padding: 8px 12px; border: 1px solid var(--row-divider); border-radius: 6px; background: var(--surface-muted); }
+.scan-progress > div { display: flex; align-items: center; gap: 12px; min-width: 0; font-size: var(--ui-font-sm); }
+.scan-progress strong { flex-shrink: 0; }
+.scan-progress span { min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; color: var(--text-muted); }
 .source-bar { display: flex; align-items: center; min-width: 0; gap: 10px; padding: 11px 12px; border: 1px solid var(--row-divider); border-radius: 7px; background: var(--surface-muted); }
 .source-icon { display: grid; place-items: center; width: 36px; height: 36px; flex-shrink: 0; color: var(--accent-color); }
 .source-copy { display: flex; flex: 1; flex-direction: column; min-width: 0; gap: 2px; }
@@ -513,6 +601,9 @@ onUnmounted(() => unsubscribe?.())
 .match-explanation { display: flex; align-items: center; gap: 7px; min-width: 0; padding-left: 22px; font-size: var(--ui-font-xs); color: var(--text-muted); }
 .match-explanation > span:not(.n-tag) { overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
 .match-explanation > .reuse-warning { margin-left: auto; color: var(--warning-color); flex-shrink: 0; }
+.font-hint, .row-warning { margin: 0; padding-left: 22px; font-size: var(--ui-font-xs); line-height: 1.6; overflow-wrap: anywhere; }
+.font-hint { color: var(--text-muted); }
+.row-warning { color: var(--warning-color); }
 .row-result { display: flex; align-items: center; min-width: 0; gap: 6px; padding-left: 22px; font-size: var(--ui-font-sm); color: var(--text-muted); }
 .row-result > .n-progress { flex: 1; max-width: 170px; }
 .row-result > span { overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
@@ -593,6 +684,9 @@ onUnmounted(() => unsubscribe?.())
 .ready-summary > svg { color: var(--accent-color); }
 .ready-summary strong { color: var(--accent-color); font-size: var(--ui-font-lg); }
 .run-warning { margin: 0; color: var(--warning-color); font-size: var(--ui-font-sm); line-height: 1.6; }
+.source-mode-warning { display: flex; flex-direction: column; gap: 5px; color: var(--warning-color); font-size: var(--ui-font-sm); }
+.source-mode-warning p { margin: 0; line-height: 1.6; }
+.source-mode-warning > div { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; }
 .acceleration-warning { display: flex; flex-direction: column; align-items: flex-start; gap: 7px; color: var(--warning-color); font-size: var(--ui-font-sm); line-height: 1.6; }
 .run-footnote { margin: 0; color: var(--text-muted); font-size: var(--ui-font-xs); line-height: 1.6; text-align: center; }
 .ffmpeg-warning { display: flex; flex-direction: column; align-items: flex-start; gap: 7px; font-size: var(--ui-font-sm); color: var(--error-color); overflow-wrap: anywhere; }

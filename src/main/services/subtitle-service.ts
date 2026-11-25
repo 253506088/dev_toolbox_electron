@@ -12,12 +12,13 @@ import type { FfmpegStatus } from '../../shared/media-api'
 import {
   SUBTITLE_EXTENSIONS, SUBTITLE_VIDEO_EXTENSIONS,
   type SubtitleBatchItem, type SubtitleBatchRequest, type SubtitleBatchSnapshot,
-  type SubtitleCandidate, type SubtitleEncoding, type SubtitleHardwareStatus, type SubtitleScanResult
+  type SubtitleCandidate, type SubtitleEncoding, type SubtitleHardwareStatus, type SubtitleInputSource, type SubtitleMatchRow, type SubtitleScanResult
 } from '../../shared/subtitle-api'
 import { matchSubtitles } from '../../shared/subtitle-matching'
 import { shiftSubtitleTimestamps } from '../../shared/subtitle-timing'
 import { estimateSubtitleRemaining, SubtitleProgressReader } from '../../shared/subtitle-progress'
 import { buildSubtitleEncodingArgs, parseSubtitleSourceInfo, SubtitleEncodingService, type SubtitleEncodingPlan } from './subtitle-encoding-service'
+import { buildEmbeddedExtractionArgs, chooseEmbeddedSubtitle, embeddedTrackCandidates, embeddedTrackLabel, isChineseEmbeddedSubtitle, parseEmbeddedVideoInfo, type EmbeddedVideoInfo } from './embedded-subtitle-service'
 
 const VIDEO_TYPES = new Set<string>(SUBTITLE_VIDEO_EXTENSIONS)
 const SUBTITLE_TYPES = new Set<string>(SUBTITLE_EXTENSIONS)
@@ -27,6 +28,7 @@ interface ScanContext {
   result: SubtitleScanResult
   owner: WebContents
   subtitles: Set<string>
+  embedded: Map<string, { fingerprint: string; info: EmbeddedVideoInfo }>
 }
 
 interface BatchContext {
@@ -36,6 +38,7 @@ interface BatchContext {
   executable: string
   cancelled: boolean
   done: Promise<void>
+  videoFingerprints: Map<string, string>
   child?: ChildProcessWithoutNullStreams
   copyAbort?: AbortController
 }
@@ -46,6 +49,10 @@ export class SubtitleService {
   private readonly batches = new Map<string, BatchContext>()
   private readonly lockedOwners = new Set<number>()
   private readonly watchedOwners = new Set<number>()
+  private readonly metadataCache = new Map<string, { fingerprint: string; info: EmbeddedVideoInfo }>()
+  private readonly scanChildren = new Map<ChildProcessWithoutNullStreams, WebContents>()
+  private readonly pendingScans = new Set<Promise<unknown>>()
+  private scanGeneration = 0
 
   constructor(private readonly ffmpeg: { status(): Promise<FfmpegStatus> }, private readonly fontDirectory?: string, private readonly encoders = new SubtitleEncodingService()) {}
 
@@ -59,9 +66,19 @@ export class SubtitleService {
   /** 只扫描选中目录的一层；选中单个视频时仍从其同目录匹配字幕。 */
   async scanPath(inputPath: string, owner: WebContents): Promise<SubtitleScanResult> {
     this.assertOwner(owner)
+    this.watchOwner(owner)
+    const generation = this.scanGeneration
+    const operation = this.performScan(inputPath, owner, generation)
+    this.pendingScans.add(operation)
+    try { return await operation }
+    finally { this.pendingScans.delete(operation) }
+  }
+
+  private async performScan(inputPath: string, owner: WebContents, generation: number): Promise<SubtitleScanResult> {
     if (typeof inputPath !== 'string' || !isAbsolute(inputPath)) throw new Error('请选择有效的绝对文件路径')
     const canonical = await realpath(inputPath)
     const info = await stat(canonical)
+    this.assertScanActive(owner, generation)
     const mode = info.isDirectory() ? 'folder' : 'video'
     if (!info.isDirectory()) await assertFile(canonical, VIDEO_TYPES, '视频')
     const directory = info.isDirectory() ? canonical : dirname(canonical)
@@ -69,17 +86,120 @@ export class SubtitleService {
     const files = entries.filter((entry) => entry.isFile()).map((entry) => join(directory, entry.name))
     const videos = mode === 'video' ? [canonical] : files.filter((file) => VIDEO_TYPES.has(extension(file)))
     const subtitles = files.filter((file) => SUBTITLE_TYPES.has(extension(file)))
+    const rows = matchSubtitles(videos, subtitles)
+    const embedded = new Map<string, { fingerprint: string; info: EmbeddedVideoInfo }>()
+    let ffmpegPath: string | undefined
+    if (rows.length > 0) {
+      const status = await this.ffmpeg.status()
+      this.assertScanActive(owner, generation)
+      if (status.available && status.path) ffmpegPath = status.path
+    }
+    let next = 0
+    let completed = 0
+    const worker = async (): Promise<void> => {
+      while (next < rows.length) {
+        this.assertScanActive(owner, generation)
+        const row = rows[next++]
+        for (const candidate of row.candidates) candidate.source = { kind: 'external', path: candidate.path }
+        if (row.subtitlePath) row.subtitleSource = { kind: 'external', path: row.subtitlePath }
+        try {
+          if (!ffmpegPath) throw new Error('FFmpeg 尚不可用，无法读取视频内置字幕')
+          const fingerprint = await fileFingerprint(row.videoPath)
+          this.assertScanActive(owner, generation)
+          const cacheKey = pathKey(row.videoPath)
+          let record = this.metadataCache.get(cacheKey)
+          if (!record || record.fingerprint !== fingerprint) {
+            const text = await this.probeEmbeddedMetadata(ffmpegPath, row.videoPath, owner, generation)
+            this.assertScanActive(owner, generation)
+            const currentFingerprint = await fileFingerprint(row.videoPath)
+            if (currentFingerprint !== fingerprint) throw new Error('视频在扫描过程中已改变，请重新扫描')
+            record = { fingerprint, info: parseEmbeddedVideoInfo(text) }
+            if (this.metadataCache.size >= 128) this.metadataCache.delete(this.metadataCache.keys().next().value!)
+            this.metadataCache.set(cacheKey, record)
+          }
+          embedded.set(row.id, record)
+          this.applyEmbeddedCandidates(row, record.info)
+        } catch (error) {
+          this.assertScanActive(owner, generation)
+          row.scanError = errorMessage(error)
+          row.embeddedTracks = []
+          row.embeddedFontCount = 0
+          if (!row.subtitlePath) row.reason = `未能读取内置字幕：${row.scanError}`
+        }
+        completed++
+        this.sendScanProgress(owner, completed, rows.length, row.videoName)
+      }
+    }
+    this.sendScanProgress(owner, 0, rows.length, '')
+    const workers = await Promise.allSettled(Array.from({ length: Math.min(2, rows.length) }, () => worker()))
+    const failure = workers.find((entry): entry is PromiseRejectedResult => entry.status === 'rejected')
+    if (failure) throw failure.reason
     const result: SubtitleScanResult = {
       scanId: randomUUID(), directory,
       outputDirectory: join(directory, `内嵌字幕处理+${basename(directory) || '根目录'}`),
-      mode, subtitleCount: subtitles.length, rows: matchSubtitles(videos, subtitles)
+      mode, subtitleCount: subtitles.length,
+      embeddedSubtitleCount: rows.reduce((sum, row) => sum + (row.embeddedTracks?.length ?? 0), 0), rows
     }
-    this.assertOwner(owner)
-    this.watchOwner(owner)
+    this.assertScanActive(owner, generation)
     const existing = [...this.scans.entries()].filter(([, scan]) => scan.owner.id === owner.id)
     for (const [id] of existing.slice(0, Math.max(0, existing.length - 3))) this.scans.delete(id)
-    this.scans.set(result.scanId, { result, owner, subtitles: new Set(subtitles.map(pathKey)) })
+    this.scans.set(result.scanId, { result, owner, subtitles: new Set(subtitles.map(pathKey)), embedded })
     return structuredClone(result)
+  }
+
+  private applyEmbeddedCandidates(row: SubtitleMatchRow, info: EmbeddedVideoInfo): void {
+    row.embeddedTracks = structuredClone(info.tracks)
+    row.embeddedFontCount = info.fonts.length
+    row.candidates = [...embeddedTrackCandidates(info.tracks), ...row.candidates]
+    const preferred = chooseEmbeddedSubtitle(info.tracks)
+    if (!preferred) {
+      if (!row.subtitlePath && info.tracks.length) row.reason = info.tracks.some((track) => track.supported)
+        ? '内置候选仅含强制或招牌字幕，请手动确认完整对白轨'
+        : '内置字幕为图片或暂不支持的格式，请选择外挂 ASS / SRT 文本字幕'
+      return
+    }
+    if (!isChineseEmbeddedSubtitle(preferred) && row.subtitlePath) return
+    row.subtitlePath = null
+    row.subtitleSource = { kind: 'embedded', streamIndex: preferred.streamIndex }
+    row.confidence = isChineseEmbeddedSubtitle(preferred) ? 'high' : 'medium'
+    row.reason = isChineseEmbeddedSubtitle(preferred) ? '自动选择视频内的中文字幕，烧录时提取字幕和字体' : '视频没有标注中文轨，选择了内置默认候选，请确认语言'
+  }
+
+  private assertScanActive(owner: WebContents, generation: number): void {
+    this.assertOwner(owner)
+    if (generation !== this.scanGeneration) throw new Error('字幕扫描已取消')
+  }
+
+  private sendScanProgress(owner: WebContents, completed: number, total: number, videoName: string): void {
+    if (owner.isDestroyed()) return
+    try { owner.send('subtitle:scan-progress', { completed, total, videoName }) }
+    catch { /* 页面关闭后不再发送扫描进度。 */ }
+  }
+
+  private probeEmbeddedMetadata(executable: string, video: string, owner: WebContents, generation: number): Promise<string> {
+    this.assertScanActive(owner, generation)
+    return new Promise((resolveProbe, reject) => {
+      // 只需容器头中的轨道/字体信息；真正编码前另有完整的视频探测。
+      const child = spawn(executable, ['-hide_banner', '-nostdin', '-analyzeduration', '1', '-probesize', '32768', '-i', video], { windowsHide: true })
+      this.scanChildren.set(child, owner)
+      let stderr = ''
+      let startupError: Error | undefined
+      let timedOut = false
+      const timer = setTimeout(() => { timedOut = true; child.kill() }, 12_000)
+      child.stdout.resume()
+      child.stderr.on('data', (chunk: Buffer) => { stderr = (stderr + chunk.toString('utf8')).slice(-1024 * 1024) })
+      child.once('error', (error) => { startupError = error })
+      child.once('close', () => {
+        clearTimeout(timer)
+        this.scanChildren.delete(child)
+        try { this.assertScanActive(owner, generation) }
+        catch (error) { reject(error); return }
+        if (startupError) reject(new Error(`无法读取内置字幕：${startupError.message}`))
+        else if (timedOut) reject(new Error('读取内置字幕超时，可重新扫描或手动选择外挂字幕'))
+        else if (!/^\s{2}Stream #0:\d+.*:\s*(?:Video|Audio|Subtitle):/m.test(stderr)) reject(new Error(`无法读取视频内的媒体轨\n${stderr.slice(-1000)}`))
+        else resolveProbe(stderr)
+      })
+    })
   }
 
   /** 登记用户手动选择的字幕，只授予当前扫描会话使用权限。 */
@@ -91,7 +211,7 @@ export class SubtitleService {
     await assertFile(path, SUBTITLE_TYPES, '字幕')
     this.assertOwner(owner)
     scan.subtitles.add(pathKey(path))
-    return { path, name: basename(path), score: 100, confidence: 'high', reason: '手动选择' }
+    return { path, source: { kind: 'external', path }, name: basename(path), score: 100, confidence: 'high', reason: '手动选择' }
   }
 
   /** 校验会话内选择，创建批次并在 IPC 返回后开始处理。 */
@@ -105,18 +225,35 @@ export class SubtitleService {
       const rows = new Map(scan.result.rows.map((row) => [row.id, row]))
       const seen = new Set<string>()
       const items: SubtitleBatchItem[] = []
+      const videoFingerprints = new Map<string, string>()
       for (const selection of request.items) {
         const row = rows.get(selection.rowId)
         if (!row || seen.has(selection.rowId)) throw new Error('视频选择无效或重复，请重新扫描')
         seen.add(selection.rowId)
-        if (typeof selection.subtitlePath !== 'string' || !scan.subtitles.has(pathKey(selection.subtitlePath))) throw new Error('请从匹配候选或文件选择框中选择字幕')
-        const subtitlePath = await realpath(selection.subtitlePath)
-        if (!scan.subtitles.has(pathKey(subtitlePath))) throw new Error('字幕路径已改变，请重新选择')
         await assertFile(row.videoPath, VIDEO_TYPES, '视频')
-        await assertFile(subtitlePath, SUBTITLE_TYPES, '字幕')
+        const record = scan.embedded.get(row.id)
+        const fingerprint = await fileFingerprint(row.videoPath)
+        if (record && fingerprint !== record.fingerprint) throw new Error('视频在扫描后已改变，请重新扫描并选择字幕')
+        videoFingerprints.set(row.id, fingerprint)
+        const source: SubtitleInputSource = selection.source ?? { kind: 'external', path: selection.subtitlePath! }
+        let subtitlePath = ''
+        let subtitleName: string
+        if (source.kind === 'embedded') {
+          if (request.mode === 'soft') throw new Error('视频内置字幕请使用“烧录到画面”，不能重复内封已有字幕轨')
+          const track = record?.info.tracks.find((candidate) => candidate.streamIndex === source.streamIndex)
+          if (!track || !track.supported) throw new Error('内置字幕索引不属于当前视频或格式不支持，请重新扫描并选择文本字幕轨')
+          subtitleName = embeddedTrackLabel(track)
+        } else {
+          if (!scan.subtitles.has(pathKey(source.path))) throw new Error('请从匹配候选或文件选择框中选择字幕')
+          subtitlePath = await realpath(source.path)
+          if (!scan.subtitles.has(pathKey(subtitlePath))) throw new Error('字幕路径已改变，请重新选择')
+          await assertFile(subtitlePath, SUBTITLE_TYPES, '字幕')
+          source.path = subtitlePath
+          subtitleName = basename(subtitlePath)
+        }
         items.push({
           id: row.id, videoPath: row.videoPath, videoName: row.videoName,
-          subtitlePath, subtitleName: basename(subtitlePath), outputPath: '',
+          source: structuredClone(source), subtitlePath, subtitleName, outputPath: '',
           status: 'queued', progress: 0, message: '等待处理'
         })
       }
@@ -135,7 +272,7 @@ export class SubtitleService {
       }
       let resolveDone!: () => void
       const done = new Promise<void>((resolveResult) => { resolveDone = resolveResult })
-      const batch: BatchContext = { snapshot, owner, request: { ...structuredClone(request), mode: snapshot.mode, acceleration: snapshot.acceleration, resolution: snapshot.resolution }, executable: ffmpeg.path, cancelled: false, done }
+      const batch: BatchContext = { snapshot, owner, request: { ...structuredClone(request), mode: snapshot.mode, acceleration: snapshot.acceleration, resolution: snapshot.resolution }, executable: ffmpeg.path, cancelled: false, done, videoFingerprints }
       this.batches.set(snapshot.batchId, batch)
       this.watchOwner(owner)
       setImmediate(() => {
@@ -182,11 +319,13 @@ export class SubtitleService {
 
   /** 主进程在退出前等待此 Promise，确保子进程退出与半成品清理完成。 */
   async stopAll(): Promise<void> {
+    this.scanGeneration++
+    for (const child of this.scanChildren.keys()) child.kill()
     for (const batch of this.batches.values()) this.cancelContext(batch)
-    await Promise.allSettled([this.encoders.stopAll(), ...[...this.batches.values()].map((batch) => batch.done)])
+    await Promise.allSettled([this.encoders.stopAll(), ...this.pendingScans, ...[...this.batches.values()].map((batch) => batch.done)])
   }
 
-  hasRunning(): boolean { return this.encoders.hasRunning() || [...this.batches.values()].some((batch) => batch.snapshot.status === 'running') }
+  hasRunning(): boolean { return this.pendingScans.size > 0 || this.scanChildren.size > 0 || this.encoders.hasRunning() || [...this.batches.values()].some((batch) => batch.snapshot.status === 'running') }
 
   private async runBatch(batch: BatchContext): Promise<void> {
     for (const item of batch.snapshot.items) {
@@ -238,13 +377,7 @@ export class SubtitleService {
       this.assertNotCancelled(batch)
       await ensureOutputDirectory(batch.snapshot.outputDirectory)
       await assertFile(item.videoPath, VIDEO_TYPES, '视频')
-      await assertFile(item.subtitlePath, SUBTITLE_TYPES, '字幕')
-      const subtitleBytes = await readFile(item.subtitlePath)
-      if (subtitleBytes.byteLength > MAX_SUBTITLE_BYTES) throw new Error('字幕文件超过 64 MB，请检查文件是否正确')
-      const text = shiftSubtitleTimestamps(decodeSubtitle(subtitleBytes, batch.request.encoding), extension(item.subtitlePath), batch.request.offsetSeconds)
-      const subtitlePath = join(temporaryDirectory, `subtitle${extname(item.subtitlePath).toLowerCase()}`)
-      await writeFile(subtitlePath, text, { encoding: 'utf8', flag: 'wx' })
-      this.assertNotCancelled(batch)
+      if (await fileFingerprint(item.videoPath) !== batch.videoFingerprints.get(item.id)) throw new Error('视频在任务开始后已改变，请重新扫描')
       const probe = await this.execute(batch, ['-hide_banner', '-nostdin', '-i', item.videoPath], 30_000)
       this.assertNotCancelled(batch)
       const metadata = parseSubtitleVideoProbe(probe.stderr)
@@ -253,9 +386,36 @@ export class SubtitleService {
       if (source.width > 0) item.sourceWidth = source.width
       if (source.height > 0) item.sourceHeight = source.height
       const burning = batch.snapshot.mode === 'burn'
+      if (burning) await this.prepareBurnFonts(batch, temporaryDirectory, item.videoPath)
+      let rawSubtitlePath = item.subtitlePath
+      let subtitleExtension = extension(item.subtitlePath)
+      let subtitleEncoding = batch.request.encoding
+      const embeddedSource = item.source
+      if (embeddedSource?.kind === 'embedded') {
+        const embedded = parseEmbeddedVideoInfo(probe.stderr)
+        const track = embedded.tracks.find((entry) => entry.streamIndex === embeddedSource.streamIndex)
+        if (!track?.supported) throw new Error('所选内置字幕轨已改变或不支持，请重新扫描')
+        item.message = '正在提取视频内置字幕和字体（原视频只读）'
+        this.emit(batch)
+        const extraction = buildEmbeddedExtractionArgs(item.videoPath, track, embedded.fonts, temporaryDirectory)
+        const result = await this.execute(batch, extraction.args, 0)
+        this.assertNotCancelled(batch)
+        if (result.code !== 0) throw new Error(`提取内置字幕或字体失败\n${result.stderr.slice(-2400)}`)
+        for (const font of extraction.fontTargets) await assertExtractedFont(font.path)
+        rawSubtitlePath = extraction.rawSubtitlePath
+        subtitleExtension = extraction.subtitleExtension
+        subtitleEncoding = 'utf8'
+      }
+      await assertFile(rawSubtitlePath, SUBTITLE_TYPES, '字幕')
+      if (await fileFingerprint(item.videoPath) !== batch.videoFingerprints.get(item.id)) throw new Error('视频在字幕读取过程中已改变，请重新扫描')
+      const subtitleBytes = await readFile(rawSubtitlePath)
+      if (subtitleBytes.byteLength > MAX_SUBTITLE_BYTES) throw new Error('字幕文件超过 64 MB，请检查文件是否正确')
+      const text = shiftSubtitleTimestamps(decodeSubtitle(subtitleBytes, subtitleEncoding), subtitleExtension, batch.request.offsetSeconds)
+      const subtitlePath = join(temporaryDirectory, `subtitle.${subtitleExtension}`)
+      await writeFile(subtitlePath, text, { encoding: 'utf8', flag: 'wx' })
+      this.assertNotCancelled(batch)
       let plan: SubtitleEncodingPlan | undefined
       if (burning) {
-        await this.prepareBurnFonts(batch, temporaryDirectory, item.videoPath)
         item.phase = batch.snapshot.acceleration === 'auto' ? 'probing' : 'preparing'
         item.message = batch.snapshot.acceleration === 'auto' ? '正在预检 Intel QSV 硬件解码与字幕烧录' : '准备 CPU 快速编码（veryfast，4 个编码线程）'
         this.emit(batch)
@@ -454,7 +614,7 @@ export class SubtitleService {
       child.stdout.resume()
       child.stderr.on('data', (chunk: Buffer) => {
         const text = chunk.toString('utf8')
-        stderr = (stderr + text).slice(-65536)
+        stderr = (stderr + text).slice(-1024 * 1024)
         if (onLine) {
           lines += text
           const parts = lines.split(/\r?\n/)
@@ -501,6 +661,7 @@ export class SubtitleService {
     if (this.watchedOwners.has(owner.id)) return
     this.watchedOwners.add(owner.id)
     owner.once('destroyed', () => {
+      for (const [child, scanOwner] of this.scanChildren) if (scanOwner.id === owner.id) child.kill()
       for (const [id, scan] of this.scans) if (scan.owner.id === owner.id) this.scans.delete(id)
       for (const [id, batch] of this.batches) {
         if (batch.owner.id !== owner.id) continue
@@ -619,7 +780,35 @@ function validateRequest(request: SubtitleBatchRequest): void {
   if (request.resolution !== undefined && !['source', '1080p'].includes(request.resolution)) throw new Error('输出分辨率模式无效')
   if (!['auto', 'utf8', 'gb18030', 'big5', 'shift_jis'].includes(request.encoding)) throw new Error('字幕编码无效')
   if (!Number.isFinite(request.offsetSeconds) || Math.abs(request.offsetSeconds) > 3600) throw new Error('字幕时间偏移必须在 -3600 到 3600 秒之间')
-  if (request.items.some((item) => !item || typeof item.rowId !== 'string' || typeof item.subtitlePath !== 'string')) throw new Error('字幕任务参数无效')
+  if (request.items.some((item) => !item || typeof item.rowId !== 'string')) throw new Error('字幕任务参数无效')
+  for (const item of request.items) {
+    if (item.source !== undefined) {
+      if (item.subtitlePath !== undefined) throw new Error('请只指定一种字幕来源，不要同时提交外挂路径和内置轨')
+      if (!item.source || typeof item.source !== 'object') throw new Error('字幕来源无效')
+      if (item.source.kind === 'external') {
+        if (typeof item.source.path !== 'string' || !isAbsolute(item.source.path)) throw new Error('外挂字幕路径无效')
+      } else if (item.source.kind === 'embedded') {
+        if (!Number.isSafeInteger(item.source.streamIndex) || item.source.streamIndex < 0) throw new Error('内置字幕流索引无效')
+      } else throw new Error('字幕来源类型无效')
+    } else if (typeof item.subtitlePath !== 'string' || !isAbsolute(item.subtitlePath)) throw new Error('字幕任务参数无效')
+  }
+}
+
+async function fileFingerprint(path: string): Promise<string> {
+  const info = await lstat(path)
+  if (!info.isFile() || info.isSymbolicLink()) throw new Error('视频文件不可访问或已被替换为链接')
+  return `${info.dev}:${info.ino}:${info.size}:${info.mtimeMs}`
+}
+
+async function assertExtractedFont(path: string): Promise<void> {
+  const info = await lstat(path)
+  if (!info.isFile() || info.isSymbolicLink() || info.size < 4) throw new Error('视频字体附件未能完整导出')
+  const file = await open(path, 'r')
+  try {
+    const header = Buffer.alloc(4)
+    await file.read(header, 0, 4, 0)
+    if (header.readUInt32BE(0) !== 0x00010000 && !['OTTO', 'ttcf'].includes(header.toString('ascii'))) throw new Error('视频字体附件格式无效，不能保证字幕正确显示')
+  } finally { await file.close() }
 }
 
 async function assertFile(path: string, types: Set<string>, label: string): Promise<void> {

@@ -215,6 +215,7 @@ describe.skipIf(!existsSync(executable) || !existsSync(bundledFont))('真实字�
   it('无音轨的视频也能烧录字幕并独立播放', async () => {
     const test = await fixture()
     ffmpeg(['-v', 'error', '-f', 'lavfi', '-i', `color=c=blue:s=${WIDTH}x${HEIGHT}:r=10:d=3`, '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-an', '-y', test.video])
+    test.scan = await test.subject.scanPath(test.video, owner(test.fake))
     const started = await test.subject.start(request(test.scan), owner(test.fake))
     const complete = await waitDone(test.subject, test.fake, started.batchId)
     expect(complete.items[0].error).toBeUndefined()
@@ -245,6 +246,7 @@ describe.skipIf(!existsSync(executable) || !existsSync(bundledFont))('真实字�
   it('真实编码进度出现后取消整批，并由 stopAll 等待半成品清理', async () => {
     const test = await fixture('1\n00:00:00,000 --> 00:00:20,000\n需要取消的中文字幕\n\n')
     ffmpeg(['-v', 'error', '-f', 'lavfi', '-i', `testsrc2=s=${WIDTH}x${HEIGHT}:r=30:d=20`, '-f', 'lavfi', '-i', 'sine=frequency=440:duration=20', '-c:v', 'libx264', '-preset', 'ultrafast', '-pix_fmt', 'yuv420p', '-c:a', 'aac', '-shortest', '-y', test.video])
+    test.scan = await test.subject.scanPath(test.video, owner(test.fake))
     let stopped: Promise<void> | undefined
     let observedEncoding = false
     test.fake.on('subtitle:event', (snapshot: SubtitleBatchSnapshot) => {

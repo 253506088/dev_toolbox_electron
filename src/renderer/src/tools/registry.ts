@@ -94,7 +94,7 @@ export const tools: ToolRegistration[] = [
   },
   {
     id: 'subtitle-embed',
-    name: '外挂字幕内嵌',
+    name: '视频字幕烧录',
     group: '图片与视频',
     icon: Subtitles,
     component: defineAsyncComponent(() => import('./SubtitleEmbedTool.vue'))

@@ -59,6 +59,19 @@ fs.writeFileSync(manualSubtitle, '1\n00:00:00,200 --> 00:00:02,500\n手动选择
 const hash = (file) => crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex')
 const sources = [...videos, ...subtitles, manualSubtitle].map((file) => ({ file, hash: hash(file) }))
 
+const embeddedDirectory = path.join(output, '内置字幕样例')
+const embeddedAssets = path.join(output, 'embedded-assets')
+fs.mkdirSync(embeddedDirectory)
+fs.mkdirSync(embeddedAssets)
+const englishSubtitle = path.join(embeddedAssets, 'english.srt')
+const chineseSubtitle = path.join(embeddedAssets, 'chinese.srt')
+fs.writeFileSync(englishSubtitle, '1\n00:00:00,200 --> 00:00:02,500\nEnglish default track\n', 'utf8')
+fs.writeFileSync(chineseSubtitle, '1\n00:00:00,200 --> 00:00:02,500\n内置中文字幕\n', 'utf8')
+const embeddedVideo = path.join(embeddedDirectory, 'Internal.Movie.S01E01.mkv')
+const bundledFont = packaged ? path.join(path.dirname(target), 'subtitle-fonts', 'NotoSansSC.ttf') : path.join(root, 'resources', 'subtitle-fonts', 'NotoSansSC.ttf')
+command(['-hide_banner', '-v', 'error', '-i', videos[0], '-i', englishSubtitle, '-i', chineseSubtitle, '-map', '0:V:0', '-map', '0:a:0', '-map', '1:s:0', '-map', '2:s:0', '-c', 'copy', '-metadata:s:s:0', 'language=eng', '-metadata:s:s:0', 'title=English', '-disposition:s:0', 'default', '-metadata:s:s:1', 'language=chi', '-metadata:s:s:1', 'title=简体中文', '-disposition:s:1', '0', '-attach', bundledFont, '-metadata:s:t:0', 'filename=NotoSansSC.ttf', '-metadata:s:t:0', 'mimetype=font/ttf', '-n', embeddedVideo])
+const embeddedHash = hash(embeddedVideo)
+
 function burnedFramePixels(file, seconds) {
   const result = spawnSync(ffmpeg, ['-v', 'error', '-ss', String(seconds), '-i', file, '-sn', '-frames:v', '1', '-pix_fmt', 'rgb24', '-f', 'rawvideo', '-'], { windowsHide: true, timeout: 20_000, maxBuffer: 2 * 1024 * 1024 })
   assert.equal(result.status, 0, result.stderr?.toString())
@@ -134,8 +147,10 @@ async function screenshot(name) {
 async function waitBatch(previousId) {
   await waitFor(async () => {
     const snapshot = await window.electronApi.subtitles.snapshot()
+    const error = document.querySelector('.error-banner')?.textContent?.trim()
+    if (error) throw new Error(`Subtitle UI startup failed: ${error}`)
     return snapshot && snapshot.status !== 'running' && snapshot.batchId !== window.__subtitlePreviousId
-  }, 'batch finishes')
+  }, 'batch finishes', 30_000)
   const batch = await evaluate(() => window.electronApi.subtitles.snapshot())
   assert.notEqual(batch.batchId, previousId)
   assert(batch.items.every((item) => item.status === 'succeeded'), JSON.stringify(batch))
@@ -145,7 +160,7 @@ async function waitBatch(previousId) {
 async function run() {
   await waitFor(() => Boolean(window.electronApi && document.querySelector('.tool-nav-button')), 'application mounts')
   await evaluate(() => {
-    [...document.querySelectorAll('.tool-nav-button')].find((button) => button.textContent.includes('外挂字幕内嵌')).click()
+    [...document.querySelectorAll('.tool-nav-button')].find((button) => button.textContent.includes('视频字幕烧录')).click()
   })
   await waitFor(() => Boolean(document.querySelector('[data-testid="subtitle-select-folder"]')), 'subtitle page mounts')
   assert(await evaluate(() => document.querySelector('[data-testid="subtitle-mode-burn"]')?.getAttribute('aria-pressed') === 'true'), 'New page must default to visible burned captions')
@@ -167,6 +182,11 @@ async function run() {
   assert.equal(report.hardware.qsvAvailable, true, 'This Intel Arc machine must pass its real hardware check')
   assert(/Intel/i.test(report.hardware.gpuName ?? ''), JSON.stringify(report.hardware))
   await click('[data-testid="subtitle-start"]')
+  await waitFor(async () => {
+    const error = document.querySelector('.error-banner')?.textContent?.trim()
+    if (error) throw new Error(`Subtitle UI startup failed: ${error}`)
+    return Boolean(await window.electronApi.subtitles.snapshot())
+  }, 'first batch starts')
   await evaluate(() => { [...document.querySelectorAll('.tool-nav-button')].find((button) => button.textContent.includes('时间转换')).click() })
   const first = await waitBatch()
   assert.equal(first.items.length, 1, 'Deselected and unmatched videos must not process')
@@ -183,7 +203,7 @@ async function run() {
   report.firstHardwareItem = first.items[0]
   verifyBurnedVideo(first.items[0].outputPath)
   report.checks.push('default-burn-folder-match-selection-background-encoding')
-  await evaluate(() => { [...document.querySelectorAll('.tool-nav-button')].find((button) => button.textContent.includes('外挂字幕内嵌')).click() })
+  await evaluate(() => { [...document.querySelectorAll('.tool-nav-button')].find((button) => button.textContent.includes('视频字幕烧录')).click() })
   await screenshot('completed-light')
 
   selections.push(videos[2])
@@ -225,6 +245,26 @@ async function run() {
   assert(!overflow.body && overflow.startVisible, JSON.stringify(overflow))
   assert.equal(report.errors.length, 0, report.errors.join('\n'))
   report.checks.push('light-dark-minimum-window-layout')
+
+  selections.push(embeddedDirectory)
+  await click('[data-testid="subtitle-select-folder"]')
+  await waitFor(() => document.querySelectorAll('[data-testid="subtitle-match-row"]').length === 1 && document.querySelector('[data-testid="subtitle-match-row"]')?.textContent.includes('Internal.Movie'), 'video-only folder discovers embedded tracks')
+  const embeddedText = await evaluate(() => document.querySelector('[data-testid="subtitle-match-row"]')?.textContent)
+  assert(embeddedText.includes('简体中文'), 'Chinese embedded track must be recommended over English default')
+  await click('[data-testid="subtitle-mode-soft"]')
+  assert(await evaluate(() => document.querySelector('[data-testid="subtitle-start"]')?.disabled), 'Embedded source cannot silently be re-muxed or skipped in soft mode')
+  await click('[data-testid="subtitle-mode-burn"]')
+  await evaluate((id) => { window.__subtitlePreviousId = id }, explicitCpu.batchId)
+  await click('[data-testid="subtitle-start"]')
+  const embeddedBatch = await waitBatch(explicitCpu.batchId)
+  assert.equal(embeddedBatch.items[0].source?.kind, 'embedded')
+  assert.equal(embeddedBatch.items[0].source?.streamIndex, 3)
+  assert.equal(embeddedBatch.items[0].actualEncoder, 'h264_qsv')
+  verifyBurnedVideo(embeddedBatch.items[0].outputPath)
+  assert.equal(hash(embeddedVideo), embeddedHash)
+  report.embeddedItem = embeddedBatch.items[0]
+  report.checks.push('video-only-folder-auto-chinese-track-font-extraction-and-burn')
+  await screenshot('embedded-track-completed')
 
   const videoOnly = path.join(output, 'video-only')
   fs.mkdirSync(videoOnly)
